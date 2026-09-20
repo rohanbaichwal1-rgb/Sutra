@@ -1,0 +1,9 @@
+.pio/
+.vscode/
+*.bin
+*.elf
+*.map
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
