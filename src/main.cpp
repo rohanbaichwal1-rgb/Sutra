@@ -38,6 +38,9 @@
 #include "MAX30105.h"
 #include "DigitalFilter.h"
 #include <7Semi_BMI270.h>
+#include <RmssdReferences.h>
+
+rmssd::Monitor referenceMonitor;
 
 void resetElgendiState();
 enum MotionState
@@ -1661,9 +1664,10 @@ void resetRmssdStabilityState()
 }
 
 // ============================================================
-// BASELINE RMSSD MODULE
+// SESSION BASELINE RMSSD MODULE
 //
-// Establishes the user's personal resting RMSSD baseline.
+// Retains the PoC's frozen five-minute resting session baseline.
+// This is the LONG_TERM trigger-path substitute, not a seven-day baseline.
 // PoC approach: accumulate RMSSD samples during confirmed
 // low-motion + good-signal + LMS-converged periods until
 // BASELINE_CALIBRATION_MS worth of *qualifying* time has been
@@ -1731,10 +1735,10 @@ void updateBaseline(uint32_t nowMs)
         baselineAccum += currentRMSSD;
         baselineSampleCount++;
 
-        Serial.print("[BASELINE] qualifying sample RMSSD=");
-        Serial.print(currentRMSSD, 2);
-        Serial.print(" qualifyingMs=");
-        Serial.println(baselineQualifyingMs);
+        // Serial.print("[Session baseline] qualifying sample RMSSD=");
+        // Serial.print(currentRMSSD, 2);
+        // Serial.print(" qualifyingMs=");
+        // Serial.println(baselineQualifyingMs);
     }
 
     if (baselineQualifyingMs >= BASELINE_CALIBRATION_MS &&
@@ -1743,7 +1747,7 @@ void updateBaseline(uint32_t nowMs)
         baselineRMSSD = baselineAccum / (float)baselineSampleCount;
         baselineState = BASELINE_ESTABLISHED;
 
-        Serial.print("[BASELINE] ESTABLISHED = ");
+        Serial.print("[Session baseline] ESTABLISHED = ");
         Serial.println(baselineRMSSD, 2);
     }
 }
@@ -1758,7 +1762,7 @@ void resetBaseline()
     lastBaselineSampleMs = 0;
     lastBaselineEvalMs = 0;
 
-    Serial.println("[BASELINE] reset - recalibrating");
+    Serial.println("[Session baseline] reset - recalibrating");
 }
 
 // Positive = RMSSD has dropped below baseline by this %.
@@ -1773,18 +1777,10 @@ float getRmssdDeviationPercent()
 // ============================================================
 // PHASE-1 PoC: LOCAL P1 / P2 TRIGGERS + HAPTIC ACTUATION
 //
-// This layer deliberately does not alter the existing PPG, LMS,
-// beat-detection, IBI, RMSSD, baseline, signal-quality, or motion
-// algorithms. It only observes their existing outputs.
-//
-// Qualification for both triggers:
-//   1. Personal RMSSD baseline has been established.
-//   2. Current RMSSD is valid.
-//   3. Existing signal-quality placeholder reports good quality.
-//   4. Confirmed motion state is LOW.
-//
-// P1: RMSSD deviation >= 20% continuously for 30 seconds.
-// P2: RMSSD deviation >= 30% continuously for 120 seconds.
+// The session and short-term references have independent P1/P2 timers.
+// LONG_TERM denotes the session-baseline substitute in this PoC; the future
+// seven-day personal baseline is not collected or persisted by this firmware.
+// See lib/RmssdReferences for rolling median, freeze and recovery rules.
 //
 // IMPORTANT HARDWARE NOTE:
 // HAPTIC_OUTPUT_PIN must drive the EN/IN input of a suitable LRA
@@ -1796,11 +1792,6 @@ float getRmssdDeviationPercent()
 #define HAPTIC_ACTIVE_LEVEL HIGH
 #define HAPTIC_INACTIVE_LEVEL LOW
 
-#define P1_DEVIATION_PERCENT 20.0f
-#define P2_DEVIATION_PERCENT 30.0f
-#define P1_HOLD_MS 30000UL
-#define P2_HOLD_MS 120000UL
-
 // P1 is a shorter, gentler notification pattern.
 #define P1_HAPTIC_PULSES 3
 #define P1_HAPTIC_ON_MS 180UL
@@ -1810,23 +1801,6 @@ float getRmssdDeviationPercent()
 #define P2_HAPTIC_PULSES 6
 #define P2_HAPTIC_ON_MS 350UL
 #define P2_HAPTIC_OFF_MS 140UL
-
-enum StressTriggerState
-{
-    STRESS_MONITORING,
-    STRESS_P1_TRIGGERED,
-    STRESS_P2_TRIGGERED
-};
-
-StressTriggerState stressTriggerState = STRESS_MONITORING;
-
-uint32_t p1ConditionSinceMs = 0;
-uint32_t p2ConditionSinceMs = 0;
-
-bool p1ConditionActive = false;
-bool p2ConditionActive = false;
-bool p1TriggeredThisEpisode = false;
-bool p2TriggeredThisEpisode = false;
 
 // Non-blocking haptic sequencer. Keeping this non-blocking ensures that
 // acquisition and all existing physiological processing continue during
@@ -1889,117 +1863,58 @@ void updateHapticActuator(uint32_t nowMs)
     }
 }
 
-void resetStressTriggerEpisode()
+// RMSSD can remain mathematically valid while its last accepted beat is old.
+// Require fresh RMSSD input as well as the existing LMS-HR validity gate.
+bool isReferenceInputFresh(uint32_t nowMs)
 {
-    p1ConditionSinceMs = 0;
-    p2ConditionSinceMs = 0;
-    p1ConditionActive = false;
-    p2ConditionActive = false;
-    p1TriggeredThisEpisode = false;
-    p2TriggeredThisEpisode = false;
-    stressTriggerState = STRESS_MONITORING;
+    if (!rmssdValid || !isLmsHRValid() || rmssdCount == 0)
+        return false;
+    int newest = (rmssdHead + RMSSD_BUFFER_SIZE - 1) % RMSSD_BUFFER_SIZE;
+    return nowMs - rmssdBuf[newest].tMs < STALE_RESEED_MS;
 }
 
 void updateStressTriggers(uint32_t nowMs)
 {
-    bool qualifies =
-        baselineState == BASELINE_ESTABLISHED &&
-        baselineRMSSD > 0.0f &&
-        rmssdValid &&
-        isSignalQualityGoodPlaceholder() &&
-        motionState == MOTION_LOW;
+    rmssd::Input input = {
+        nowMs,
+        currentRMSSD,
+        isReferenceInputFresh(nowMs) && latestAccelOK && latestGyroOK,
+        motionState == MOTION_LOW,
+        isRmssdStableGate(),
+        hapticPatternActive,
+        baselineState == BASELINE_ESTABLISHED,
+        baselineRMSSD};
+    rmssd::Events events = referenceMonitor.update(input);
 
-    if (!qualifies)
+    if (events.froze)
+        Serial.println("[Short-term reference] FROZEN");
+    if (events.resumed)
+        Serial.println("[Short-term reference] recovery complete - adaptation resumed");
+
+    if (events.p1 != rmssd::Source::NONE)
     {
-        // P1/P2 require a continuous qualifying interval. Any loss of
-        // LOW motion, RMSSD validity, or signal quality ends the episode.
-        resetStressTriggerEpisode();
-        return;
+        Serial.print("[P1] TRIGGERED | TriggerSource:");
+        Serial.print(rmssd::sourceName(events.p1));
+        Serial.println(" | LongTermBasis:SESSION_BASELINE");
     }
-
-    float deviationPercent = getRmssdDeviationPercent();
-
-    // ------------------------- P1 ----------------------------
-    bool p1Now = deviationPercent >= P1_DEVIATION_PERCENT;
-
-    if (p1Now)
+    if (events.p2 != rmssd::Source::NONE)
     {
-        if (!p1ConditionActive)
-        {
-            p1ConditionActive = true;
-            p1ConditionSinceMs = nowMs;
-            Serial.println("[P1] 20% RMSSD-deviation timer started");
-        }
-
-        if (!p1TriggeredThisEpisode &&
-            (uint32_t)(nowMs - p1ConditionSinceMs) >= P1_HOLD_MS)
-        {
-            p1TriggeredThisEpisode = true;
-            stressTriggerState = STRESS_P1_TRIGGERED;
-
-            Serial.println("[P1] TRIGGERED - local haptic started");
-            startHapticPattern(
-                P1_HAPTIC_PULSES,
-                P1_HAPTIC_ON_MS,
-                P1_HAPTIC_OFF_MS,
-                nowMs);
-        }
+        Serial.print("[P2] TRIGGERED | TriggerSource:");
+        Serial.print(rmssd::sourceName(events.p2));
+        Serial.println(" | LongTermBasis:SESSION_BASELINE");
+        startHapticPattern(P2_HAPTIC_PULSES, P2_HAPTIC_ON_MS, P2_HAPTIC_OFF_MS, nowMs);
     }
-    else
+    else if (events.p1 != rmssd::Source::NONE)
     {
-        // Falling below 20% ends the current stress episode and allows
-        // a future qualifying episode to trigger P1/P2 again.
-        resetStressTriggerEpisode();
-        return;
-    }
-
-    // ------------------------- P2 ----------------------------
-    bool p2Now = deviationPercent >= P2_DEVIATION_PERCENT;
-
-    if (p2Now)
-    {
-        if (!p2ConditionActive)
-        {
-            p2ConditionActive = true;
-            p2ConditionSinceMs = nowMs;
-            Serial.println("[P2] 30% RMSSD-deviation timer started");
-        }
-
-        if (!p2TriggeredThisEpisode &&
-            (uint32_t)(nowMs - p2ConditionSinceMs) >= P2_HOLD_MS)
-        {
-            p2TriggeredThisEpisode = true;
-            stressTriggerState = STRESS_P2_TRIGGERED;
-
-            Serial.println("[P2] TRIGGERED - stronger local haptic started");
-            startHapticPattern(
-                P2_HAPTIC_PULSES,
-                P2_HAPTIC_ON_MS,
-                P2_HAPTIC_OFF_MS,
-                nowMs);
-        }
-    }
-    else
-    {
-        // P1 may remain active from 20-29.9%, but P2 must accumulate
-        // its own uninterrupted time at or above 30%.
-        p2ConditionActive = false;
-        p2ConditionSinceMs = 0;
+        startHapticPattern(P1_HAPTIC_PULSES, P1_HAPTIC_ON_MS, P1_HAPTIC_OFF_MS, nowMs);
     }
 }
 
 const char *getStressTriggerStateName()
 {
-    switch (stressTriggerState)
-    {
-    case STRESS_MONITORING:
-        return "MONITORING";
-    case STRESS_P1_TRIGGERED:
-        return "P1";
-    case STRESS_P2_TRIGGERED:
-        return "P2";
-    }
-    return "?";
+    if (referenceMonitor.p2Triggered()) return "P2";
+    if (referenceMonitor.p1Triggered()) return "P1";
+    return "MONITORING";
 }
 
 void processSample(uint32_t green, uint32_t nowMs);
@@ -2027,6 +1942,10 @@ void setup()
     Serial.println("==========================================");
     Serial.println("ESP32-S3 + MAX30101 + BMI270");
     Serial.println("Reference + LMS/Elgendi");
+    Serial.println("LONG_TERM trigger path uses Session baseline (PoC)");
+    Serial.print("Post-exercise recovery: ");
+    Serial.print(rmssd::POST_EXERCISE_RECOVERY_MS / 1000UL);
+    Serial.println(" seconds of LOW motion");
     Serial.println("==========================================");
 
 #if defined(ARDUINO_ARCH_ESP32)
@@ -2147,39 +2066,40 @@ void setup()
     W1_SAMPLES = 11;
     W2_SAMPLES = 67;
 
-    Serial.println();
-    Serial.println("==========================================");
-    Serial.println("INITIAL PARAMETERS");
-    Serial.print("Sensor rate: ");
-    Serial.print(SAMPLE_RATE_HZ);
-    Serial.println(" Hz");
-
-    Serial.print("MAX301 sampleAverage: ");
-    Serial.println(sampleAverage);
-
-    Serial.print("LMS mu: ");
-    Serial.println(LMS_MU, 4);
-
-    Serial.print("LMS motion scale: ");
-    Serial.println(LMS_MOTION_SCALE, 1);
-
-    Serial.print("LMS max adapt error: ");
-    Serial.println(LMS_MAX_ADAPT_ERROR, 1);
-
-    Serial.print("DC alpha: ");
-    Serial.println(DC_REMOVER_ALPHA, 3);
-
-    Serial.print("Elgendi beta: ");
-    Serial.println(ELGENDI_BETA, 3);
-
-    Serial.print("Initial W1: ");
-    Serial.println(W1_SAMPLES);
-
-    Serial.print("Initial W2: ");
-    Serial.println(W2_SAMPLES);
-
-    Serial.println("==========================================");
-    Serial.println();
+    // Detailed startup parameters (uncomment when tuning).
+    // Serial.println();
+    // Serial.println("==========================================");
+    // Serial.println("INITIAL PARAMETERS");
+    // Serial.print("Sensor rate: ");
+    // Serial.print(SAMPLE_RATE_HZ);
+    // Serial.println(" Hz");
+    //
+    // Serial.print("MAX301 sampleAverage: ");
+    // Serial.println(sampleAverage);
+    //
+    // Serial.print("LMS mu: ");
+    // Serial.println(LMS_MU, 4);
+    //
+    // Serial.print("LMS motion scale: ");
+    // Serial.println(LMS_MOTION_SCALE, 1);
+    //
+    // Serial.print("LMS max adapt error: ");
+    // Serial.println(LMS_MAX_ADAPT_ERROR, 1);
+    //
+    // Serial.print("DC alpha: ");
+    // Serial.println(DC_REMOVER_ALPHA, 3);
+    //
+    // Serial.print("Elgendi beta: ");
+    // Serial.println(ELGENDI_BETA, 3);
+    //
+    // Serial.print("Initial W1: ");
+    // Serial.println(W1_SAMPLES);
+    //
+    // Serial.print("Initial W2: ");
+    // Serial.println(W2_SAMPLES);
+    //
+    // Serial.println("==========================================");
+    // Serial.println();
 
     tsLastReport = millis();
     rateWindowStartMs = millis();
@@ -2267,6 +2187,7 @@ void loop()
         uint32_t motionNowMs = millis();
         updateMotionState(motionNowMs);
         updateLmsFastMotionGate(motionNowMs);
+        referenceMonitor.observeMotion(motionNowMs, motionState == MOTION_LOW);
     }
 
     // ========================================================
@@ -2274,6 +2195,10 @@ void loop()
     // ========================================================
 
     uint32_t nowMs = millis();
+
+    // A brief invalid period between reports must break continuous holds.
+    if (!isReferenceInputFresh(nowMs) || !latestAccelOK || !latestGyroOK)
+        referenceMonitor.interruptContinuity();
 
     if (nowMs - rateWindowStartMs >= 1000)
     {
@@ -2308,133 +2233,50 @@ void loop()
         updateBaseline(nowMs);
         updateStressTriggers(nowMs);
 
-        bool refValid =
-            isReferenceHRValid();
+        bool lmsValid = isLmsHRValid();
 
-        bool lmsValid =
-            isLmsHRValid();
-
-        Serial.print("MAX30101");
-
-        Serial.print(" | RefHR:");
-
-        if (refValid)
-        {
-            Serial.print(currentBPM, 1);
-            Serial.print("bpm");
-        }
-        else
-        {
-            Serial.print("--");
-        }
-
-        Serial.print(" | RefIBI:");
-
-        if (refValid)
-        {
-            Serial.print(currentIBI);
-            Serial.print("ms");
-        }
-        else
-        {
-            Serial.print("--");
-        }
-
-        Serial.print(" | LMS-HR:");
-
+        // One compact group per report: readings, quality, references, timers.
+        Serial.print("[");
+        Serial.print(nowMs / 1000UL);
+        Serial.print("s] LMS-HR:");
         if (lmsValid)
         {
-            Serial.print(lmsHR_smoothed, 2);
+            Serial.print(lmsHR_smoothed, 1);
             Serial.print("bpm");
         }
-        else
-        {
-            Serial.print("--");
-        }
+        else Serial.print("--");
 
         Serial.print(" | LMS-IBI:");
-
         if (latestCleanedIBI > 0 && lmsValid)
         {
-            uint32_t displayedIbi =
-                (uint32_t)roundf(medianRecentLmsIbi());
-            Serial.print(displayedIbi);
+            Serial.print((uint32_t)roundf(medianRecentLmsIbi()));
             Serial.print("ms");
         }
-        else
-        {
-            Serial.print("--");
-        }
-
+        else Serial.print("--");
         newCleanedIBIAvailable = false;
 
         Serial.print(" | Finger:");
-        Serial.print(
-            fingerPresent ? "Y" : "N");
-
-        // ====================================================
-        // IMPORTANT DEBUG INFORMATION
-        // ====================================================
-
-        Serial.print(" | LMS_N:");
-        Serial.print(lmsTotalSamples);
-
-        Serial.print(" | LMSrate:");
-        Serial.print(measuredLmsRateHz, 1);
-        Serial.print("Hz");
-
-        Serial.print(" | W1:");
-        Serial.print(W1_SAMPLES);
-
-        Serial.print(" | W2:");
-        Serial.print(W2_SAMPLES);
-
-        Serial.print(" | MApeak:");
-        Serial.print(dbgMAPeak, 1);
-
-        Serial.print(" | MAbeat:");
-        Serial.print(dbgMABeat, 1);
-
-        Serial.print(" | THR1:");
-        Serial.print(dbgTHR1, 1);
-
-        Serial.print(" | Block:");
-        Serial.print(dbgLastBlockLen);
-
-        Serial.print(" | MotionRef:");
-        Serial.print(g_latestMotionRef, 4);
-
-        Serial.print(" | LMSweight:");
-        Serial.print(g_lmsWeight, 4);
-
-        Serial.print(" | LMSadapt:");
-        Serial.print(g_lmsFastMotion ? "Y" : "N");
-
-        Serial.print(" | LMSweightSm:");
-        Serial.print(lmsWeightSmoothed, 4);
-
-        Serial.print(" | LMSconverged:");
-        Serial.print(isLmsConvergedGate() ? "Y" : "N");
-
-        Serial.print(" | RMSSDstable:");
-        Serial.print(isRmssdStableGate() ? "Y" : "N");
-
-        // ====================================================
-        // RMSSD / BASELINE
-        // ====================================================
-
+        Serial.print(fingerPresent ? "Y" : "N");
         Serial.print(" | RMSSD:");
         if (rmssdValid)
         {
             Serial.print(currentRMSSD, 1);
             Serial.print("ms");
         }
-        else
-        {
-            Serial.print("--");
-        }
+        else Serial.print("--");
+        Serial.print(" | Motion:");
+        Serial.println(getMotionStateName());
 
-        Serial.print(" | Baseline:");
+        Serial.print("  Quality | LMSconverged:");
+        Serial.print(isLmsConvergedGate() ? "Y" : "N");
+        Serial.print(" | RMSSDstable:");
+        Serial.print(isRmssdStableGate() ? "Y" : "N");
+        Serial.print(" | Fresh:");
+        Serial.print(isReferenceInputFresh(nowMs) ? "Y" : "N");
+        Serial.print(" | IMU:");
+        Serial.println(latestAccelOK && latestGyroOK ? "OK" : "ERROR");
+
+        Serial.print("  Reference | Session baseline:");
         if (baselineState == BASELINE_ESTABLISHED)
         {
             Serial.print(baselineRMSSD, 1);
@@ -2442,90 +2284,185 @@ void loop()
         }
         else
         {
-            Serial.print("calibrating(");
-            Serial.print(baselineQualifyingMs / 1000);
-            Serial.print("s/");
-            Serial.print(BASELINE_CALIBRATION_MS / 1000);
-            Serial.print("s)");
+            Serial.print("calibrating ");
+            Serial.print(baselineQualifyingMs / 1000UL);
+            Serial.print("/");
+            Serial.print(BASELINE_CALIBRATION_MS / 1000UL);
+            Serial.print("s");
         }
-
         Serial.print(" | DevPct:");
-        Serial.print(getRmssdDeviationPercent(), 1);
-        Serial.print("%");
-
-        Serial.print(" | StressState:");
-        Serial.print(getStressTriggerStateName());
-
-        Serial.print(" | P1Hold:");
-        if (p1ConditionActive)
-            Serial.print((nowMs - p1ConditionSinceMs) / 1000UL);
-        else
-            Serial.print(0);
-        Serial.print("s");
-
-        Serial.print(" | P2Hold:");
-        if (p2ConditionActive)
-            Serial.print((nowMs - p2ConditionSinceMs) / 1000UL);
-        else
-            Serial.print(0);
-        Serial.print("s");
-
-        Serial.print(" | MotionStd:");
-        Serial.print(latestMotionStd, 4);
-
-        Serial.print(" | GyroRms:");
-        Serial.print(latestGyroRms, 2);
-
-        Serial.print(" | MotionState:");
-        Serial.print(getMotionStateName());
-
-        // ====================================================
-        // BMI270
-        // ====================================================
-
-        Serial.print(" | ACC:");
-
-        if (latestAccelOK)
+        if (rmssdValid && baselineState == BASELINE_ESTABLISHED)
         {
-            Serial.print(latestAX, 3);
-            Serial.print(",");
-            Serial.print(latestAY, 3);
-            Serial.print(",");
-            Serial.print(latestAZ, 3);
+            Serial.print(getRmssdDeviationPercent(), 1);
+            Serial.print("%");
         }
-        else
+        else Serial.print("--");
+        Serial.print(" | Short:");
+        if (referenceMonitor.shortAvailable())
         {
-            Serial.print("ERROR");
+            Serial.print(referenceMonitor.shortReference(), 1);
+            Serial.print("ms");
         }
-
-        Serial.print(" | GYR:");
-
-        if (latestGyroOK)
+        else Serial.print("--");
+        Serial.print(" (");
+        Serial.print(referenceMonitor.frozen() ? "FROZEN" :
+                     referenceMonitor.preliminary() ? "PRELIMINARY" :
+                     referenceMonitor.shortAvailable() ? "READY" : "COLLECTING");
+        Serial.print(") | ShortDevPct:");
+        if (rmssdValid && referenceMonitor.shortAvailable())
         {
-            Serial.print(latestGX, 3);
-            Serial.print(",");
-            Serial.print(latestGY, 3);
-            Serial.print(",");
-            Serial.print(latestGZ, 3);
+            Serial.print(rmssd::Monitor::deviation(currentRMSSD, referenceMonitor.shortReference()), 1);
+            Serial.print("%");
         }
-        else
-        {
-            Serial.print("ERROR");
-        }
-
-        Serial.print(" | TEMP:");
-
-        if (latestTempOK)
-        {
-            Serial.print(latestTemp, 2);
-            Serial.print("C");
-        }
-        else
-        {
-            Serial.print("ERROR");
-        }
-
+        else Serial.print("--");
         Serial.println();
+
+        Serial.print("  Timing | ShortValid:");
+        Serial.print(referenceMonitor.validDurationMs() / 1000UL);
+        Serial.print("s (min ");
+        Serial.print(rmssd::MIN_SAMPLES * rmssd::SAMPLE_MS / 1000UL);
+        Serial.print(", target ");
+        Serial.print(rmssd::WINDOW_MS / 1000UL);
+        Serial.print(") | P1[Long/Short]:");
+        Serial.print(referenceMonitor.p1LongHoldMs(nowMs) / 1000UL);
+        Serial.print("/");
+        Serial.print(referenceMonitor.p1ShortHoldMs(nowMs) / 1000UL);
+        Serial.print("s of ");
+        Serial.print(rmssd::P1_HOLD_MS / 1000UL);
+        Serial.print("s | P2[Long/Short]:");
+        Serial.print(referenceMonitor.p2LongHoldMs(nowMs) / 1000UL);
+        Serial.print("/");
+        Serial.print(referenceMonitor.p2ShortHoldMs(nowMs) / 1000UL);
+        Serial.print("s of ");
+        Serial.print(rmssd::P2_HOLD_MS / 1000UL);
+        Serial.print("s | Recovery:");
+        Serial.print(referenceMonitor.recoveryHoldMs(nowMs) / 1000UL);
+        Serial.print("/");
+        Serial.print(rmssd::RECOVERY_HOLD_MS / 1000UL);
+        Serial.print("s | PostExercise:");
+        Serial.print(referenceMonitor.postExerciseRecovery() ? "Y" : "N");
+        Serial.print(" | State:");
+        Serial.print(getStressTriggerStateName());
+        Serial.print(" | Haptic:");
+        Serial.println(hapticPatternActive ? "ON" : "OFF");
+        Serial.println();
+
+        // Detailed diagnostics (uncomment only when troubleshooting).
+        // bool refValid = isReferenceHRValid();
+        // Serial.print(" | RefHR:");
+        //
+        // if (refValid)
+        // {
+        // Serial.print(currentBPM, 1);
+        // Serial.print("bpm");
+        // }
+        // else
+        // {
+        // Serial.print("--");
+        // }
+        //
+        // Serial.print(" | RefIBI:");
+        //
+        // if (refValid)
+        // {
+        // Serial.print(currentIBI);
+        // Serial.print("ms");
+        // }
+        // else
+        // {
+        // Serial.print("--");
+        // }
+        //
+        // Serial.print(" | LMS_N:");
+        // Serial.print(lmsTotalSamples);
+        //
+        // Serial.print(" | LMSrate:");
+        // Serial.print(measuredLmsRateHz, 1);
+        // Serial.print("Hz");
+        //
+        // Serial.print(" | W1:");
+        // Serial.print(W1_SAMPLES);
+        //
+        // Serial.print(" | W2:");
+        // Serial.print(W2_SAMPLES);
+        //
+        // Serial.print(" | MApeak:");
+        // Serial.print(dbgMAPeak, 1);
+        //
+        // Serial.print(" | MAbeat:");
+        // Serial.print(dbgMABeat, 1);
+        //
+        // Serial.print(" | THR1:");
+        // Serial.print(dbgTHR1, 1);
+        //
+        // Serial.print(" | Block:");
+        // Serial.print(dbgLastBlockLen);
+        //
+        // Serial.print(" | MotionRef:");
+        // Serial.print(g_latestMotionRef, 4);
+        //
+        // Serial.print(" | LMSweight:");
+        // Serial.print(g_lmsWeight, 4);
+        //
+        // Serial.print(" | LMSadapt:");
+        // Serial.print(g_lmsFastMotion ? "Y" : "N");
+        //
+        // Serial.print(" | LMSweightSm:");
+        // Serial.print(lmsWeightSmoothed, 4);
+        //
+        // Serial.print(" | MotionStd:");
+        // Serial.print(latestMotionStd, 4);
+        //
+        // Serial.print(" | GyroRms:");
+        // Serial.print(latestGyroRms, 2);
+        //
+        //
+        // // ====================================================
+        // // BMI270
+        // // ====================================================
+        //
+        // Serial.print(" | ACC:");
+        //
+        // if (latestAccelOK)
+        // {
+        // Serial.print(latestAX, 3);
+        // Serial.print(",");
+        // Serial.print(latestAY, 3);
+        // Serial.print(",");
+        // Serial.print(latestAZ, 3);
+        // }
+        // else
+        // {
+        // Serial.print("ERROR");
+        // }
+        //
+        // Serial.print(" | GYR:");
+        //
+        // if (latestGyroOK)
+        // {
+        // Serial.print(latestGX, 3);
+        // Serial.print(",");
+        // Serial.print(latestGY, 3);
+        // Serial.print(",");
+        // Serial.print(latestGZ, 3);
+        // }
+        // else
+        // {
+        // Serial.print("ERROR");
+        // }
+        //
+        // Serial.print(" | TEMP:");
+        //
+        // if (latestTempOK)
+        // {
+        // Serial.print(latestTemp, 2);
+        // Serial.print("C");
+        // }
+        // else
+        // {
+        // Serial.print("ERROR");
+        // }
+        //
 
         tsLastReport = nowMs;
     }
@@ -2563,6 +2500,7 @@ void processSample(
 
     if (nowPresent != fingerPresent)
     {
+        referenceMonitor.contactChanged();
         resetReferenceBeatState();
 
         resetElgendiState();
