@@ -39,6 +39,9 @@
 #include "DigitalFilter.h"
 #include <7Semi_BMI270.h>
 #include <RmssdReferences.h>
+#include <HapticPatterns.h>
+#include "HapticWireBus.h"
+#include <esp_system.h>
 
 rmssd::Monitor referenceMonitor;
 
@@ -1782,85 +1785,132 @@ float getRmssdDeviationPercent()
 // seven-day personal baseline is not collected or persisted by this firmware.
 // See lib/RmssdReferences for rolling median, freeze and recovery rules.
 //
-// IMPORTANT HARDWARE NOTE:
-// HAPTIC_OUTPUT_PIN must drive the EN/IN input of a suitable LRA
-// driver stage. Do not connect an LRA directly to an ESP32 GPIO.
-// Change this pin number to match the actual PCB connection.
+// SmartElex DA7280 modules with their onboard LRAs:
+// TCA9548A 0x70, channels 0/1/2 = left/center(P6)/right; each DA7280 = 0x4A.
+// The original single GPIO actuator is replaced by I2C DRO amplitude control.
 // ============================================================
 
-#define HAPTIC_OUTPUT_PIN 7
-#define HAPTIC_ACTIVE_LEVEL HIGH
-#define HAPTIC_INACTIVE_LEVEL LOW
+const uint32_t HAPTIC_FRAME_INTERVAL_MS = 10UL;
+const uint32_t HAPTIC_FAULT_POLL_MS = 100UL;
+const uint32_t HAPTIC_STOP_RETRY_MS = 250UL;
 
-// P1 is a shorter, gentler notification pattern.
-#define P1_HAPTIC_PULSES 3
-#define P1_HAPTIC_ON_MS 180UL
-#define P1_HAPTIC_OFF_MS 180UL
-
-// P2 is intentionally more intense: more pulses and longer ON time.
-#define P2_HAPTIC_PULSES 6
-#define P2_HAPTIC_ON_MS 350UL
-#define P2_HAPTIC_OFF_MS 140UL
-
-// Non-blocking haptic sequencer. Keeping this non-blocking ensures that
-// acquisition and all existing physiological processing continue during
-// and after both interventions.
+HapticWireBus hapticBus(Wire);
+haptics::ArrayConfig hapticArrayConfig;
+haptics::Array hapticArray(hapticBus, hapticArrayConfig);
+haptics::Patterns hapticPatterns;
 bool hapticPatternActive = false;
-bool hapticOutputOn = false;
-uint8_t hapticPulsesCompleted = 0;
-uint8_t hapticTargetPulses = 0;
-uint32_t hapticOnMs = 0;
-uint32_t hapticOffMs = 0;
-uint32_t hapticPhaseStartedMs = 0;
+bool hapticFaultReported = false;
+uint8_t reportedHapticWarnings = 0;
+uint32_t lastHapticFrameMs = 0;
+uint32_t lastHapticFaultPollMs = 0;
+uint32_t lastHapticStopRetryMs = 0;
 
-void setHapticOutput(bool on)
+const char *getHapticStateName()
 {
-    digitalWrite(
-        HAPTIC_OUTPUT_PIN,
-        on ? HAPTIC_ACTIVE_LEVEL : HAPTIC_INACTIVE_LEVEL);
-    hapticOutputOn = on;
+    if (!hapticArray.ready())
+        return hapticArray.shutdownPending() ? "FAULT_STOP_PENDING" : "FAULT";
+    if (hapticPatterns.protocol() == haptics::Protocol::P1_FLUTTER) return "P1_FLUTTER";
+    if (hapticPatterns.protocol() == haptics::Protocol::P2_SWEEP) return "P2_SWEEP";
+    return "OFF";
 }
 
-void startHapticPattern(
-    uint8_t pulseCount,
-    uint32_t onMs,
-    uint32_t offMs,
-    uint32_t nowMs)
+void reportHapticFault()
 {
-    hapticTargetPulses = pulseCount;
-    hapticOnMs = onMs;
-    hapticOffMs = offMs;
-    hapticPulsesCompleted = 0;
-    hapticPatternActive = true;
-    hapticPhaseStartedMs = nowMs;
-    setHapticOutput(true);
+    if (hapticArray.warningBits() != reportedHapticWarnings)
+    {
+        reportedHapticWarnings = hapticArray.warningBits();
+        Serial.print("[HAPTIC] driver warning | Bits:0x");
+        Serial.println(reportedHapticWarnings, HEX);
+    }
+    if (hapticArray.ready() || hapticFaultReported) return;
+    hapticFaultReported = true;
+    Serial.print("[HAPTIC] disabled | Error:");
+    switch (hapticArray.error())
+    {
+    case haptics::ArrayError::CONFIG: Serial.print("CONFIG"); break;
+    case haptics::ArrayError::I2C: Serial.print("I2C"); break;
+    case haptics::ArrayError::CHIP_ID: Serial.print("CHIP_ID"); break;
+    case haptics::ArrayError::DRIVER_FAULT: Serial.print("DRIVER_FAULT"); break;
+    default: Serial.print("NONE"); break;
+    }
+    Serial.print(" | Motor:");
+    Serial.print(hapticArray.errorMotor());
+    Serial.print(" | FaultBits:0x");
+    Serial.println(hapticArray.faultBits(), HEX);
 }
 
 void updateHapticActuator(uint32_t nowMs)
 {
-    if (!hapticPatternActive)
-        return;
-
-    if (hapticOutputOn)
+    if (!hapticArray.ready())
     {
-        if ((uint32_t)(nowMs - hapticPhaseStartedMs) >= hapticOnMs)
+        hapticPatterns.stop();
+        if (hapticArray.shutdownPending() &&
+            nowMs - lastHapticStopRetryMs >= HAPTIC_STOP_RETRY_MS)
         {
-            setHapticOutput(false);
-            hapticPulsesCompleted++;
-            hapticPhaseStartedMs = nowMs;
-
-            if (hapticPulsesCompleted >= hapticTargetPulses)
-            {
-                hapticPatternActive = false;
-                Serial.println("[HAPTIC] pattern complete");
-            }
+            lastHapticStopRetryMs = nowMs;
+            hapticArray.stopAll();
         }
+        hapticPatternActive = hapticArray.shutdownPending();
+        reportHapticFault();
+        return;
     }
-    else if ((uint32_t)(nowMs - hapticPhaseStartedMs) >= hapticOffMs)
+    if (!hapticPatterns.active() ||
+        nowMs - lastHapticFrameMs < HAPTIC_FRAME_INTERVAL_MS)
+        return;
+    lastHapticFrameMs = nowMs;
+
+    const haptics::Frame &frame = hapticPatterns.update(nowMs);
+    if (!hapticPatterns.active())
     {
-        hapticPhaseStartedMs = nowMs;
-        setHapticOutput(true);
+        if (hapticArray.stopAll()) Serial.println("[HAPTIC] protocol complete");
     }
+    else if (!hapticArray.apply(frame))
+        hapticPatterns.stop();
+
+    if (hapticPatterns.active() && nowMs - lastHapticFaultPollMs >= HAPTIC_FAULT_POLL_MS)
+    {
+        lastHapticFaultPollMs = nowMs;
+        if (!hapticArray.pollFaults()) hapticPatterns.stop();
+    }
+    hapticPatternActive = hapticPatterns.active() || hapticArray.shutdownPending();
+    reportHapticFault();
+}
+
+void startHapticProtocol(haptics::Protocol protocol, uint32_t nowMs)
+{
+    if (!hapticArray.ready())
+    {
+        Serial.println("[HAPTIC] trigger received; driver array unavailable");
+        return;
+    }
+    if (protocol == haptics::Protocol::P1_FLUTTER &&
+        hapticPatterns.protocol() == haptics::Protocol::P2_SWEEP)
+        return; // P2 retains priority
+
+    if (!hapticArray.pollFaults() || !hapticArray.stopAll())
+    {
+        hapticPatterns.stop();
+        hapticPatternActive = hapticArray.shutdownPending();
+        reportHapticFault();
+        return;
+    }
+    // Fresh hardware seed for each flutter. P2 replaces P1 immediately.
+    nowMs = millis(); // Start the envelope after the preparation transfers.
+    bool started = protocol == haptics::Protocol::P2_SWEEP
+        ? hapticPatterns.startP2(nowMs)
+        : hapticPatterns.startP1(nowMs, esp_random());
+    if (started && !hapticArray.apply(hapticPatterns.frame())) hapticPatterns.stop();
+    lastHapticFrameMs = lastHapticFaultPollMs = nowMs;
+    hapticPatternActive = hapticPatterns.active() || hapticArray.shutdownPending();
+    if (hapticPatterns.active())
+    {
+        Serial.print("[HAPTIC] started ");
+        Serial.print(getHapticStateName());
+        Serial.print(" | Duration:");
+        Serial.print(hapticPatterns.durationMs() / 1000UL);
+        Serial.println("s");
+    }
+    reportHapticFault();
 }
 
 // RMSSD can remain mathematically valid while its last accepted beat is old.
@@ -1902,11 +1952,11 @@ void updateStressTriggers(uint32_t nowMs)
         Serial.print("[P2] TRIGGERED | TriggerSource:");
         Serial.print(rmssd::sourceName(events.p2));
         Serial.println(" | LongTermBasis:SESSION_BASELINE");
-        startHapticPattern(P2_HAPTIC_PULSES, P2_HAPTIC_ON_MS, P2_HAPTIC_OFF_MS, nowMs);
+        startHapticProtocol(haptics::Protocol::P2_SWEEP, nowMs);
     }
     else if (events.p1 != rmssd::Source::NONE)
     {
-        startHapticPattern(P1_HAPTIC_PULSES, P1_HAPTIC_ON_MS, P1_HAPTIC_OFF_MS, nowMs);
+        startHapticProtocol(haptics::Protocol::P1_FLUTTER, nowMs);
     }
 }
 
@@ -1926,9 +1976,6 @@ void processSample(uint32_t green, uint32_t nowMs);
 void setup()
 {
     Serial.begin(115200);
-
-    pinMode(HAPTIC_OUTPUT_PIN, OUTPUT);
-    setHapticOutput(false);
 
     uint32_t serialWaitStart = millis();
 
@@ -1955,6 +2002,14 @@ void setup()
 #endif
 
     Wire.setClock(I2C_SPEED);
+    Wire.setTimeOut(10); // Bound failed I2C transfers, including mux branches.
+    delay(2); // DA7280 cold-boot allowance; no delays in the playback sequencer.
+    // Sensor initialization continues if the haptic array is absent/faulty.
+    if (hapticArray.begin())
+        Serial.println("[HAPTIC] 3 x DA7280 ready | M1:CH0 M2:CH1 M3:CH2 | P1:5s P2:60s");
+    else
+        reportHapticFault();
+    hapticPatternActive = hapticArray.shutdownPending();
 
     // ========================================================
     // MAX30101
@@ -2266,6 +2321,7 @@ void loop()
         else Serial.print("--");
         Serial.print(" | Motion:");
         Serial.println(getMotionStateName());
+        updateHapticActuator(millis());
 
         Serial.print("  Quality | LMSconverged:");
         Serial.print(isLmsConvergedGate() ? "Y" : "N");
@@ -2275,6 +2331,7 @@ void loop()
         Serial.print(isReferenceInputFresh(nowMs) ? "Y" : "N");
         Serial.print(" | IMU:");
         Serial.println(latestAccelOK && latestGyroOK ? "OK" : "ERROR");
+        updateHapticActuator(millis());
 
         Serial.print("  Reference | Session baseline:");
         if (baselineState == BASELINE_ESTABLISHED)
@@ -2316,6 +2373,7 @@ void loop()
         }
         else Serial.print("--");
         Serial.println();
+        updateHapticActuator(millis());
 
         Serial.print("  Timing | ShortValid:");
         Serial.print(referenceMonitor.validDurationMs() / 1000UL);
@@ -2344,7 +2402,16 @@ void loop()
         Serial.print(" | State:");
         Serial.print(getStressTriggerStateName());
         Serial.print(" | Haptic:");
-        Serial.println(hapticPatternActive ? "ON" : "OFF");
+        Serial.print(getHapticStateName());
+        if (hapticPatterns.active())
+        {
+            Serial.print(" ");
+            Serial.print(hapticPatterns.elapsedMs(millis()) / 1000UL);
+            Serial.print("/");
+            Serial.print(hapticPatterns.durationMs() / 1000UL);
+            Serial.print("s");
+        }
+        Serial.println();
         Serial.println();
 
         // Detailed diagnostics (uncomment only when troubleshooting).

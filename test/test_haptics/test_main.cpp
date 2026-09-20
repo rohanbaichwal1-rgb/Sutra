@@ -1,0 +1,350 @@
+#include <unity.h>
+#include <HapticPatterns.h>
+#include <HapticArray.h>
+#include <string.h>
+#include <vector>
+
+using namespace haptics;
+
+void setUp() {}
+void tearDown() {}
+
+void assertFrame(const Frame &frame, unsigned left, unsigned center, unsigned right)
+{
+    TEST_ASSERT_EQUAL_UINT(left, frame.level[0]);
+    TEST_ASSERT_EQUAL_UINT(center, frame.level[1]);
+    TEST_ASSERT_EQUAL_UINT(right, frame.level[2]);
+}
+
+void test_p2_inhale_boundaries_and_ramps()
+{
+    Patterns p;
+    TEST_ASSERT_TRUE(p.startP2(100));
+    assertFrame(p.frame(), 100, 0, 0);
+    assertFrame(p.update(750), 300, 0, 0);
+    assertFrame(p.update(1399), 499, 0, 0);
+    assertFrame(p.update(1400), 0, 0, 100);
+    assertFrame(p.update(2050), 0, 0, 300);
+    assertFrame(p.update(2699), 0, 0, 499);
+    assertFrame(p.update(2700), 0, 600, 0);
+    assertFrame(p.update(4099), 0, 600, 0);
+}
+
+void test_p2_exhale_and_six_cycle_completion()
+{
+    Patterns p;
+    p.startP2(0);
+    assertFrame(p.update(4000), 0, 600, 0);
+    assertFrame(p.update(5000), 0, 450, 0);
+    assertFrame(p.update(6000), 300, 0, 300);
+    assertFrame(p.update(8000), 150, 0, 150);
+    assertFrame(p.update(9999), 1, 0, 1);
+    assertFrame(p.update(10000), 100, 0, 0);
+    assertFrame(p.update(50000), 100, 0, 0);
+    TEST_ASSERT_TRUE(p.active());
+    assertFrame(p.update(60000), 0, 0, 0);
+    TEST_ASSERT_FALSE(p.active());
+}
+
+void test_p1_independent_bursts_intensity_and_duration_limits()
+{
+    Patterns p;
+    p.startP1(0, 12345);
+    bool on[3] = {false, false, false};
+    uint32_t changed[3] = {0, 0, 0};
+    unsigned bursts[3] = {0, 0, 0};
+    uint32_t firstDuration = 0;
+    bool varied = false;
+    bool overlap = false;
+    for (uint32_t t = 0; t <= 5000; ++t)
+    {
+        const Frame &f = p.update(t);
+        unsigned active = 0;
+        for (unsigned m = 0; m < 3; ++m)
+        {
+            TEST_ASSERT_TRUE(f.level[m] == 0 || f.level[m] == 900);
+            bool next = f.level[m] != 0;
+            if (next) ++active;
+            if (next == on[m]) continue;
+            uint32_t duration = t - changed[m];
+            if (on[m])
+            {
+                TEST_ASSERT_GREATER_OR_EQUAL_UINT32(60, duration);
+                TEST_ASSERT_LESS_OR_EQUAL_UINT32(250, duration);
+                if (!firstDuration) firstDuration = duration;
+                else if (duration != firstDuration) varied = true;
+            }
+            else
+            {
+                if (bursts[m] > 0)
+                {
+                    TEST_ASSERT_GREATER_OR_EQUAL_UINT32(50, duration);
+                    TEST_ASSERT_LESS_OR_EQUAL_UINT32(450, duration);
+                }
+                ++bursts[m];
+            }
+            on[m] = next;
+            changed[m] = t;
+        }
+        if (active > 1) overlap = true;
+    }
+    for (unsigned m = 0; m < 3; ++m) TEST_ASSERT_GREATER_THAN_UINT(3, bursts[m]);
+    TEST_ASSERT_TRUE(varied);
+    TEST_ASSERT_TRUE(overlap);
+    TEST_ASSERT_FALSE(p.active());
+    assertFrame(p.frame(), 0, 0, 0);
+}
+
+void test_p2_preempts_p1_and_p1_cannot_interrupt_p2()
+{
+    Patterns p;
+    p.startP1(0, 17);
+    TEST_ASSERT_TRUE(p.startP2(123));
+    assertFrame(p.frame(), 100, 0, 0);
+    TEST_ASSERT_FALSE(p.startP1(124, 18));
+    assertFrame(p.update(8123), 150, 0, 150);
+    p.stop();
+    assertFrame(p.frame(), 0, 0, 0);
+}
+
+void test_patterns_handle_late_updates_and_millis_wrap()
+{
+    Patterns p;
+    p.startP2(UINT32_MAX - 3999, 1);
+    assertFrame(p.update(0), 0, 600, 0);
+    assertFrame(p.update(4000), 150, 0, 150);
+    assertFrame(p.update(6000), 0, 0, 0);
+    p.startP1(UINT32_MAX - 99, 9876);
+    assertFrame(p.update(6000), 0, 0, 0);
+    TEST_ASSERT_FALSE(p.active());
+    TEST_ASSERT_FALSE(p.startP2(0, 0));
+    TEST_ASSERT_FALSE(p.startP1(0, 1, 59));
+}
+
+class FakeBus : public I2cBus
+{
+public:
+    uint8_t registers[8][256] = {};
+    uint8_t mux = 0;
+    int nackChannel = -1;
+    int failedSelect = -1;
+    bool failReads = false;
+    bool multiChannelWrite = false;
+    struct Write { unsigned channel; uint8_t reg; uint8_t value; };
+    std::vector<Write> writes;
+
+    FakeBus()
+    {
+        for (auto &r : registers)
+        {
+            r[0] = 0xBA;
+            r[0x08] = 0x40;
+            r[0x0A] = 0x21;
+            r[0x0B] = 0x4F;
+            r[0x0C] = 0x5A;
+            r[0x0D] = 0x78;
+            r[0x0E] = 0x17;
+            r[0x0F] = 0x01;
+            r[0x10] = 0x0D;
+            r[0x13] = 0x1E;
+            r[0x14] = 0x01;
+            r[0x24] = 0x08;
+        }
+    }
+    int channel() const
+    {
+        for (int ch = 0; ch < 8; ++ch) if (mux == (1U << ch)) return ch;
+        return -1;
+    }
+    bool write(uint8_t address, const uint8_t *data, size_t size) override
+    {
+        if (address == 0x70 && size == 1)
+        {
+            if (failedSelect >= 0 && data[0] == (1U << failedSelect)) return false;
+            mux = data[0];
+            return true;
+        }
+        if (address != 0x4A || size != 2) return false;
+        int ch = channel();
+        if (ch < 0) { multiChannelWrite = true; return false; }
+        if (ch == nackChannel) return false;
+        writes.push_back({static_cast<unsigned>(ch), data[0], data[1]});
+        if (data[0] == 0x03) registers[ch][data[0]] &= ~data[1];
+        else registers[ch][data[0]] = data[1];
+        return true;
+    }
+    bool readRegister(uint8_t address, uint8_t reg, uint8_t &value) override
+    {
+        int ch = channel();
+        if (failReads || ch < 0 || ch == nackChannel || address != 0x4A) return false;
+        value = registers[ch][reg];
+        return true;
+    }
+};
+
+void assertStopped(const FakeBus &bus, unsigned ch)
+{
+    TEST_ASSERT_EQUAL_UINT8(0, bus.registers[ch][0x23]);
+    TEST_ASSERT_EQUAL_UINT8(0, bus.registers[ch][0x22]);
+}
+
+void test_driver_initializes_each_mux_channel_without_replacing_motor_profile()
+{
+    FakeBus bus;
+    Array driver(bus);
+    TEST_ASSERT_TRUE(driver.begin());
+    TEST_ASSERT_TRUE(driver.ready());
+    TEST_ASSERT_EQUAL_UINT8(0, bus.mux);
+    for (unsigned ch = 0; ch < 3; ++ch)
+    {
+        assertStopped(bus, ch);
+        TEST_ASSERT_EQUAL_UINT8(0x5A, bus.registers[ch][0x0C]);
+        TEST_ASSERT_EQUAL_UINT8(0x78, bus.registers[ch][0x0D]);
+        TEST_ASSERT_EQUAL_UINT8(0x17, bus.registers[ch][0x0E]);
+        TEST_ASSERT_EQUAL_UINT8(0x1E, bus.registers[ch][0x13]);
+        TEST_ASSERT_EQUAL_UINT8(0, bus.registers[ch][0x08] & 0x40);
+    }
+    for (const auto &w : bus.writes)
+        TEST_ASSERT_FALSE(w.reg >= 0x0A && w.reg <= 0x10);
+    TEST_ASSERT_FALSE(bus.multiChannelWrite);
+}
+
+void test_driver_outer_motors_continue_together_after_mux_disconnect()
+{
+    FakeBus bus;
+    Array driver(bus);
+    Patterns p;
+    driver.begin();
+    p.startP2(0);
+    TEST_ASSERT_TRUE(driver.apply(p.update(6000)));
+    TEST_ASSERT_EQUAL_UINT8(38, bus.registers[0][0x23]);
+    TEST_ASSERT_EQUAL_UINT8(0, bus.registers[1][0x23]);
+    TEST_ASSERT_EQUAL_UINT8(38, bus.registers[2][0x23]);
+    TEST_ASSERT_EQUAL_UINT8(1, bus.registers[0][0x22]);
+    TEST_ASSERT_EQUAL_UINT8(1, bus.registers[2][0x22]);
+    TEST_ASSERT_EQUAL_UINT8(0, bus.mux);
+    TEST_ASSERT_TRUE(driver.stopAll());
+    for (unsigned ch = 0; ch < 3; ++ch) assertStopped(bus, ch);
+    TEST_ASSERT_EQUAL_UINT8(114, Array::amplitudeCode(900));
+    TEST_ASSERT_EQUAL_UINT8(76, Array::amplitudeCode(600));
+    TEST_ASSERT_EQUAL_UINT8(127, Array::amplitudeCode(65535));
+}
+
+void test_driver_stops_old_motor_before_sweep_handoff()
+{
+    FakeBus bus;
+    Array driver(bus);
+    Patterns p;
+    driver.begin();
+    p.startP2(0);
+    driver.apply(p.update(2590)); // right on
+    bus.writes.clear();
+    driver.apply(p.update(2600)); // center on, right off
+    TEST_ASSERT_GREATER_OR_EQUAL_UINT(3, bus.writes.size());
+    TEST_ASSERT_EQUAL_UINT(2, bus.writes[0].channel);
+    TEST_ASSERT_EQUAL_UINT8(0x23, bus.writes[0].reg);
+    TEST_ASSERT_EQUAL_UINT8(0, bus.writes[0].value);
+    TEST_ASSERT_EQUAL_UINT(1, bus.writes[1].channel);
+}
+
+void test_i2c_failure_latches_and_attempts_stop_on_other_channels()
+{
+    FakeBus bus;
+    Array driver(bus);
+    driver.begin();
+    Frame f;
+    f.level[0] = f.level[1] = f.level[2] = 900;
+    driver.apply(f);
+    bus.nackChannel = 1;
+    f.level[1] = 300;
+    TEST_ASSERT_FALSE(driver.apply(f));
+    TEST_ASSERT_FALSE(driver.ready());
+    TEST_ASSERT_TRUE(driver.shutdownPending());
+    assertStopped(bus, 0);
+    assertStopped(bus, 2);
+    TEST_ASSERT_EQUAL_UINT8(0, bus.mux);
+    bus.nackChannel = -1;
+    TEST_ASSERT_TRUE(driver.stopAll());
+    TEST_ASSERT_FALSE(driver.shutdownPending());
+    TEST_ASSERT_FALSE(driver.ready()); // fault cannot silently restart a protocol
+    assertStopped(bus, 1);
+}
+
+void test_failed_mux_selection_does_not_write_to_previous_motor()
+{
+    FakeBus bus;
+    Array driver(bus);
+    driver.begin();
+    bus.failedSelect = 1;
+    Frame f;
+    f.level[1] = 900;
+    TEST_ASSERT_FALSE(driver.apply(f));
+    for (const auto &w : bus.writes)
+        if (w.reg == 0x23) TEST_ASSERT_EQUAL_UINT8(0, w.value);
+    TEST_ASSERT_FALSE(bus.multiChannelWrite);
+}
+
+void test_hardware_fault_stops_all_three_motors()
+{
+    FakeBus bus;
+    Array driver(bus);
+    driver.begin();
+    Frame f;
+    f.level[0] = f.level[1] = f.level[2] = 600;
+    driver.apply(f);
+    bus.registers[2][0x03] = 0x80;
+    TEST_ASSERT_FALSE(driver.pollFaults());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ArrayError::DRIVER_FAULT), static_cast<int>(driver.error()));
+    TEST_ASSERT_EQUAL_UINT8(3, driver.errorMotor());
+    TEST_ASSERT_EQUAL_UINT8(0x80, driver.faultBits());
+    for (unsigned ch = 0; ch < 3; ++ch) assertStopped(bus, ch);
+}
+
+void test_missing_driver_or_invalid_channel_mapping_is_not_ready()
+{
+    FakeBus bus;
+    bus.registers[1][0] = 0;
+    Array driver(bus);
+    TEST_ASSERT_FALSE(driver.begin());
+    TEST_ASSERT_FALSE(driver.ready());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ArrayError::CHIP_ID), static_cast<int>(driver.error()));
+    ArrayConfig config;
+    config.channels[1] = 0;
+    Array duplicate(bus, config);
+    TEST_ASSERT_FALSE(duplicate.begin());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(ArrayError::CONFIG), static_cast<int>(duplicate.error()));
+}
+
+void test_supply_warning_is_reported_but_thermal_warning_stops()
+{
+    FakeBus bus;
+    Array driver(bus);
+    driver.begin();
+    bus.registers[0][0x03] = 0x20;
+    bus.registers[0][0x04] = 0xC0;
+    TEST_ASSERT_TRUE(driver.pollFaults());
+    TEST_ASSERT_EQUAL_UINT8(0xC0, driver.warningBits());
+    bus.registers[0][0x03] = 0x20;
+    bus.registers[0][0x04] = 0x08;
+    TEST_ASSERT_FALSE(driver.pollFaults());
+    TEST_ASSERT_FALSE(driver.ready());
+}
+
+int main()
+{
+    UNITY_BEGIN();
+    RUN_TEST(test_p2_inhale_boundaries_and_ramps);
+    RUN_TEST(test_p2_exhale_and_six_cycle_completion);
+    RUN_TEST(test_p1_independent_bursts_intensity_and_duration_limits);
+    RUN_TEST(test_p2_preempts_p1_and_p1_cannot_interrupt_p2);
+    RUN_TEST(test_patterns_handle_late_updates_and_millis_wrap);
+    RUN_TEST(test_driver_initializes_each_mux_channel_without_replacing_motor_profile);
+    RUN_TEST(test_driver_outer_motors_continue_together_after_mux_disconnect);
+    RUN_TEST(test_driver_stops_old_motor_before_sweep_handoff);
+    RUN_TEST(test_i2c_failure_latches_and_attempts_stop_on_other_channels);
+    RUN_TEST(test_failed_mux_selection_does_not_write_to_previous_motor);
+    RUN_TEST(test_hardware_fault_stops_all_three_motors);
+    RUN_TEST(test_missing_driver_or_invalid_channel_mapping_is_not_ready);
+    RUN_TEST(test_supply_warning_is_reported_but_thermal_warning_stops);
+    return UNITY_END();
+}

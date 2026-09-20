@@ -53,6 +53,8 @@ are `LONG_TERM`, `SHORT_TERM`, or `BOTH`; `BOTH` means both paths completed that
 level's duration at the firing time. P1 and P2 retain separate source records.
 One path's partial hold cannot be transferred to the other. Each level fires
 at most once per episode. P2 takes actuator priority if both levels fire together.
+The three-motor actuation sequences and DA7280/mux mapping are described in
+[haptic-protocols.md](haptic-protocols.md).
 
 The reference stays frozen throughout the episode and intervention. A freeze
 before P1 clears after 60 continuous seconds of stable, qualified recovery below
