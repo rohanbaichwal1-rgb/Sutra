@@ -1,6 +1,7 @@
 #include <unity.h>
 #include <HapticPatterns.h>
 #include <HapticArray.h>
+#include <RmssdReferences.h>
 #include <string.h>
 #include <vector>
 
@@ -129,6 +130,8 @@ public:
     int nackChannel = -1;
     int failedSelect = -1;
     bool failReads = false;
+    bool nackMux = false;
+    bool loseStartAck = false;
     bool multiChannelWrite = false;
     struct Write { unsigned channel; uint8_t reg; uint8_t value; };
     std::vector<Write> writes;
@@ -160,6 +163,7 @@ public:
     {
         if (address == 0x70 && size == 1)
         {
+            if (nackMux) return false;
             if (failedSelect >= 0 && data[0] == (1U << failedSelect)) return false;
             mux = data[0];
             return true;
@@ -171,6 +175,11 @@ public:
         writes.push_back({static_cast<unsigned>(ch), data[0], data[1]});
         if (data[0] == 0x03) registers[ch][data[0]] &= ~data[1];
         else registers[ch][data[0]] = data[1];
+        if (loseStartAck && data[0] == 0x22 && data[1] == 1)
+        {
+            nackChannel = ch; // command took effect, but bus contact was lost
+            return false;
+        }
         return true;
     }
     bool readRegister(uint8_t address, uint8_t reg, uint8_t &value) override
@@ -260,12 +269,14 @@ void test_i2c_failure_latches_and_attempts_stop_on_other_channels()
     TEST_ASSERT_FALSE(driver.apply(f));
     TEST_ASSERT_FALSE(driver.ready());
     TEST_ASSERT_TRUE(driver.shutdownPending());
+    TEST_ASSERT_TRUE(driver.outputStopPending());
     assertStopped(bus, 0);
     assertStopped(bus, 2);
     TEST_ASSERT_EQUAL_UINT8(0, bus.mux);
     bus.nackChannel = -1;
     TEST_ASSERT_TRUE(driver.stopAll());
     TEST_ASSERT_FALSE(driver.shutdownPending());
+    TEST_ASSERT_FALSE(driver.outputStopPending());
     TEST_ASSERT_FALSE(driver.ready()); // fault cannot silently restart a protocol
     assertStopped(bus, 1);
 }
@@ -330,6 +341,58 @@ void test_supply_warning_is_reported_but_thermal_warning_stops()
     TEST_ASSERT_FALSE(driver.ready());
 }
 
+void test_absent_haptics_at_startup_do_not_block_short_reference()
+{
+    // Reproduce both a missing mux and a missing DA7280 on one branch.
+    for (unsigned scenario = 0; scenario < 2; ++scenario)
+    {
+        FakeBus bus;
+        bus.nackMux = scenario == 0;
+        bus.nackChannel = scenario == 1 ? 1 : -1;
+        Array driver(bus);
+        TEST_ASSERT_FALSE(driver.begin());
+        TEST_ASSERT_TRUE(driver.shutdownPending());
+        TEST_ASSERT_FALSE(driver.outputStopPending());
+        rmssd::Monitor monitor;
+        for (uint32_t t = 0; t <= 60000; t += 1000)
+        {
+            driver.stopAll(); // repeated failed cleanup does not start playback
+            rmssd::Input input = {t, 79.0f, true, rmssd::Motion::LOW_MOTION, true,
+                                  driver.outputStopPending(), false, 0.0f};
+            monitor.update(input);
+        }
+        TEST_ASSERT_TRUE(monitor.shortAvailable());
+        TEST_ASSERT_EQUAL_UINT32(60000, monitor.validDurationMs());
+        TEST_ASSERT_FALSE(driver.ready()); // do not silently enable bad hardware
+    }
+}
+
+void test_lost_playback_ack_blocks_collection_until_output_stops()
+{
+    FakeBus bus;
+    Array driver(bus);
+    TEST_ASSERT_TRUE(driver.begin());
+    bus.loseStartAck = true;
+    Frame f;
+    f.level[1] = 600;
+    TEST_ASSERT_FALSE(driver.apply(f));
+    TEST_ASSERT_TRUE(driver.outputStopPending());
+    TEST_ASSERT_EQUAL_UINT8(1, bus.registers[1][0x22]);
+    rmssd::Monitor monitor;
+    for (uint32_t t = 0; t <= 200000; t += 1000)
+    {
+        rmssd::Input input = {t, 79.0f, true, rmssd::Motion::LOW_MOTION, true,
+                              driver.outputStopPending(), false, 0.0f};
+        monitor.update(input);
+    }
+    TEST_ASSERT_EQUAL_UINT(0, monitor.sampleCount());
+    TEST_ASSERT_FALSE(monitor.shortAvailable());
+    bus.nackChannel = -1;
+    TEST_ASSERT_TRUE(driver.stopAll());
+    TEST_ASSERT_FALSE(driver.outputStopPending());
+    assertStopped(bus, 1);
+}
+
 int main()
 {
     UNITY_BEGIN();
@@ -346,5 +409,7 @@ int main()
     RUN_TEST(test_hardware_fault_stops_all_three_motors);
     RUN_TEST(test_missing_driver_or_invalid_channel_mapping_is_not_ready);
     RUN_TEST(test_supply_warning_is_reported_but_thermal_warning_stops);
+    RUN_TEST(test_absent_haptics_at_startup_do_not_block_short_reference);
+    RUN_TEST(test_lost_playback_ack_blocks_collection_until_output_stops);
     return UNITY_END();
 }

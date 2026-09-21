@@ -33,6 +33,9 @@ public:
     bool stopAll();
     bool ready() const { return ready_; }
     bool shutdownPending() const { return shutdownPending_; }
+    // Failed stop transfers alone do not mean an intervention is running:
+    // absent hardware at startup has never received a playback command.
+    bool outputStopPending() const;
     ArrayError error() const { return error_; }
     uint8_t errorMotor() const { return errorMotor_; } // 1..3, or 0 for mux/config
     uint8_t faultBits() const { return faultBits_; }

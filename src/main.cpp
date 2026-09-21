@@ -41,9 +41,13 @@
 #include <RmssdReferences.h>
 #include <HapticPatterns.h>
 #include "HapticWireBus.h"
+#include "NvsBaselineStore.h"
 #include <esp_system.h>
 
 rmssd::Monitor referenceMonitor;
+personal::Collector sessionCollector;
+personal::History personalBaseline;
+NvsBaselineStore baselineStore;
 
 void resetElgendiState();
 enum MotionState
@@ -59,6 +63,12 @@ MotionState motionState = MOTION_LOW;
 MotionState motionCandidateState = MOTION_LOW;
 uint32_t motionCandidateSinceMs = 0;
 uint32_t motionStateEnteredMs = 0;
+
+rmssd::Motion getReferenceMotion()
+{
+    return motionState == MOTION_HIGH ? rmssd::Motion::HIGH_MOTION : motionState == MOTION_MODERATE ? rmssd::Motion::MODERATE_MOTION
+                                                                                                    : rmssd::Motion::LOW_MOTION;
+}
 
 MAX30105 particleSensor;
 BMI270_7Semi imu;
@@ -1667,123 +1677,58 @@ void resetRmssdStabilityState()
 }
 
 // ============================================================
-// SESSION BASELINE RMSSD MODULE
-//
-// Retains the PoC's frozen five-minute resting session baseline.
-// This is the LONG_TERM trigger-path substitute, not a seven-day baseline.
-// PoC approach: accumulate RMSSD samples during confirmed
-// low-motion + good-signal + LMS-converged periods until
-// BASELINE_CALIBRATION_MS worth of *qualifying* time has been
-// collected, then average. Baseline then freezes ("established
-// personal baseline"). Brief disqualifying windows PAUSE
-// calibration, they don't reset it.
+// SEVEN-SESSION PERSONAL BASELINE (PROTOTYPE, NO CALENDAR)
+// Each boot collects one median from 20 qualifying five-second resting blocks.
+// Only the persisted median of seven sessions enables the LONG_TERM path.
 // ============================================================
 
-#define BASELINE_CALIBRATION_MS 300000UL   // 5 min qualifying data
-#define BASELINE_SAMPLE_INTERVAL_MS 5000UL // fold RMSSD into baseline every 5s
-
-enum BaselineState
-{
-    BASELINE_CALIBRATING,
-    BASELINE_ESTABLISHED
-};
-
-BaselineState baselineState = BASELINE_CALIBRATING;
-
-float baselineRMSSD = 0.0f;
-uint32_t baselineQualifyingMs = 0;
-uint32_t lastBaselineSampleMs = 0;
-uint32_t lastBaselineEvalMs = 0;
-
-float baselineAccum = 0.0f;
-uint32_t baselineSampleCount = 0;
+bool baselineSaveError = false;
+bool baselineSaveAttempted = false;
+uint32_t lastBaselineSaveAttemptMs = 0;
+const uint32_t BASELINE_SAVE_RETRY_MS = 10000UL;
 
 void updateBaseline(uint32_t nowMs)
 {
-    updateLmsConvergence(nowMs);
-    updateRmssdStability(nowMs);
-
-    if (baselineState == BASELINE_ESTABLISHED)
+    // Collect this boot's resting measurement independently of the short
+    // reference. Collector stops accepting data at 100 s.
+    bool qualifies = referenceMonitor.restingGate() == rmssd::CollectionGate::OPEN &&
+                     isLmsConvergedGate();
+    sessionCollector.update(nowMs, currentRMSSD, qualifies);
+    if (!sessionCollector.complete() || personalBaseline.savedThisBoot() ||
+        !personalBaseline.storageReady() || !qualifies)
         return;
-
-    // Both gates required: LMSconverged proves the FILTER has settled,
-    // RmssdStable proves the METRIC ITSELF has leveled off. Neither one
-    // alone is sufficient - this is the direct fix for baseline locking
-    // in on a still-climbing RMSSD trend (see RMSSD STABILITY GATE note
-    // above for the real session data that exposed this).
-    bool qualifies =
-        rmssdValid &&
-        isLowMotionPlaceholder() &&
-        isSignalQualityGoodPlaceholder() &&
-        isLmsConvergedGate() &&
-        isRmssdStableGate();
-
-    // Measure actual wall-clock qualifying time. This prevents the
-    // calibration timer from depending on perfect 1 s report timing.
-    if (lastBaselineEvalMs == 0)
-        lastBaselineEvalMs = nowMs;
-
-    uint32_t elapsedMs = nowMs - lastBaselineEvalMs;
-    lastBaselineEvalMs = nowMs;
-
-    if (!qualifies)
-        return; // pause, don't reset
-
-    baselineQualifyingMs += elapsedMs;
-
-    if (nowMs - lastBaselineSampleMs >= BASELINE_SAMPLE_INTERVAL_MS)
+    if (baselineSaveAttempted && nowMs - lastBaselineSaveAttemptMs < BASELINE_SAVE_RETRY_MS)
+        return;
+    baselineSaveAttempted = true;
+    lastBaselineSaveAttemptMs = nowMs;
+    if (!personalBaseline.saveSession(sessionCollector.median()))
     {
-        lastBaselineSampleMs = nowMs;
-
-        baselineAccum += currentRMSSD;
-        baselineSampleCount++;
-
-        // Serial.print("[Session baseline] qualifying sample RMSSD=");
-        // Serial.print(currentRMSSD, 2);
-        // Serial.print(" qualifyingMs=");
-        // Serial.println(baselineQualifyingMs);
+        if (!baselineSaveError)
+            Serial.println("[Personal baseline] SAVE FAILED; retrying, previous history retained");
+        baselineSaveError = true;
+        return;
     }
-
-    if (baselineQualifyingMs >= BASELINE_CALIBRATION_MS &&
-        baselineSampleCount > 0)
+    baselineSaveError = false;
+    Serial.print("[Personal baseline] session SAVED | Median:");
+    Serial.print(sessionCollector.median(), 1);
+    Serial.print("ms | Saved sessions:");
+    Serial.print(personalBaseline.count());
+    Serial.print("/7 | Long-term:");
+    if (personalBaseline.ready())
     {
-        baselineRMSSD = baselineAccum / (float)baselineSampleCount;
-        baselineState = BASELINE_ESTABLISHED;
-
-        Serial.print("[Session baseline] ESTABLISHED = ");
-        Serial.println(baselineRMSSD, 2);
+        Serial.print(personalBaseline.baseline(), 1);
+        Serial.println("ms (READY, SEVEN_SESSIONS)");
     }
-}
-
-void resetBaseline()
-{
-    baselineState = BASELINE_CALIBRATING;
-    baselineRMSSD = 0.0f;
-    baselineQualifyingMs = 0;
-    baselineAccum = 0.0f;
-    baselineSampleCount = 0;
-    lastBaselineSampleMs = 0;
-    lastBaselineEvalMs = 0;
-
-    Serial.println("[Session baseline] reset - recalibrating");
-}
-
-// Positive = RMSSD has dropped below baseline by this %.
-float getRmssdDeviationPercent()
-{
-    if (baselineState != BASELINE_ESTABLISHED || baselineRMSSD <= 0.0f)
-        return 0.0f;
-
-    return 100.0f * (baselineRMSSD - currentRMSSD) / baselineRMSSD;
+    else
+        Serial.println("UNAVAILABLE (session + short-term triggers enabled)");
 }
 
 // ============================================================
 // PHASE-1 PoC: LOCAL P1 / P2 TRIGGERS + HAPTIC ACTUATION
 //
-// The session and short-term references have independent P1/P2 timers.
-// LONG_TERM denotes the session-baseline substitute in this PoC; the future
-// seven-day personal baseline is not collected or persisted by this firmware.
-// See lib/RmssdReferences for rolling median, freeze and recovery rules.
+// Session, live short-term, and seven-session personal references have independent timers.
+// LONG_TERM is enabled only after seven completed sessions are saved in NVS.
+// See lib/RmssdReferences for rolling median and recovery rules.
 //
 // SmartElex DA7280 modules with their onboard LRAs:
 // TCA9548A 0x70, channels 0/1/2 = left/center(P6)/right; each DA7280 = 0x4A.
@@ -1808,9 +1753,11 @@ uint32_t lastHapticStopRetryMs = 0;
 const char *getHapticStateName()
 {
     if (!hapticArray.ready())
-        return hapticArray.shutdownPending() ? "FAULT_STOP_PENDING" : "FAULT";
-    if (hapticPatterns.protocol() == haptics::Protocol::P1_FLUTTER) return "P1_FLUTTER";
-    if (hapticPatterns.protocol() == haptics::Protocol::P2_SWEEP) return "P2_SWEEP";
+        return hapticArray.outputStopPending() ? "FAULT_STOP_PENDING" : "FAULT";
+    if (hapticPatterns.protocol() == haptics::Protocol::P1_FLUTTER)
+        return "P1_FLUTTER";
+    if (hapticPatterns.protocol() == haptics::Protocol::P2_SWEEP)
+        return "P2_SWEEP";
     return "OFF";
 }
 
@@ -1822,16 +1769,27 @@ void reportHapticFault()
         Serial.print("[HAPTIC] driver warning | Bits:0x");
         Serial.println(reportedHapticWarnings, HEX);
     }
-    if (hapticArray.ready() || hapticFaultReported) return;
+    if (hapticArray.ready() || hapticFaultReported)
+        return;
     hapticFaultReported = true;
     Serial.print("[HAPTIC] disabled | Error:");
     switch (hapticArray.error())
     {
-    case haptics::ArrayError::CONFIG: Serial.print("CONFIG"); break;
-    case haptics::ArrayError::I2C: Serial.print("I2C"); break;
-    case haptics::ArrayError::CHIP_ID: Serial.print("CHIP_ID"); break;
-    case haptics::ArrayError::DRIVER_FAULT: Serial.print("DRIVER_FAULT"); break;
-    default: Serial.print("NONE"); break;
+    case haptics::ArrayError::CONFIG:
+        Serial.print("CONFIG");
+        break;
+    case haptics::ArrayError::I2C:
+        Serial.print("I2C");
+        break;
+    case haptics::ArrayError::CHIP_ID:
+        Serial.print("CHIP_ID");
+        break;
+    case haptics::ArrayError::DRIVER_FAULT:
+        Serial.print("DRIVER_FAULT");
+        break;
+    default:
+        Serial.print("NONE");
+        break;
     }
     Serial.print(" | Motor:");
     Serial.print(hapticArray.errorMotor());
@@ -1850,7 +1808,7 @@ void updateHapticActuator(uint32_t nowMs)
             lastHapticStopRetryMs = nowMs;
             hapticArray.stopAll();
         }
-        hapticPatternActive = hapticArray.shutdownPending();
+        hapticPatternActive = hapticArray.outputStopPending();
         reportHapticFault();
         return;
     }
@@ -1862,7 +1820,8 @@ void updateHapticActuator(uint32_t nowMs)
     const haptics::Frame &frame = hapticPatterns.update(nowMs);
     if (!hapticPatterns.active())
     {
-        if (hapticArray.stopAll()) Serial.println("[HAPTIC] protocol complete");
+        if (hapticArray.stopAll())
+            Serial.println("[HAPTIC] protocol complete");
     }
     else if (!hapticArray.apply(frame))
         hapticPatterns.stop();
@@ -1870,9 +1829,10 @@ void updateHapticActuator(uint32_t nowMs)
     if (hapticPatterns.active() && nowMs - lastHapticFaultPollMs >= HAPTIC_FAULT_POLL_MS)
     {
         lastHapticFaultPollMs = nowMs;
-        if (!hapticArray.pollFaults()) hapticPatterns.stop();
+        if (!hapticArray.pollFaults())
+            hapticPatterns.stop();
     }
-    hapticPatternActive = hapticPatterns.active() || hapticArray.shutdownPending();
+    hapticPatternActive = hapticPatterns.active() || hapticArray.outputStopPending();
     reportHapticFault();
 }
 
@@ -1890,18 +1850,19 @@ void startHapticProtocol(haptics::Protocol protocol, uint32_t nowMs)
     if (!hapticArray.pollFaults() || !hapticArray.stopAll())
     {
         hapticPatterns.stop();
-        hapticPatternActive = hapticArray.shutdownPending();
+        hapticPatternActive = hapticArray.outputStopPending();
         reportHapticFault();
         return;
     }
     // Fresh hardware seed for each flutter. P2 replaces P1 immediately.
     nowMs = millis(); // Start the envelope after the preparation transfers.
     bool started = protocol == haptics::Protocol::P2_SWEEP
-        ? hapticPatterns.startP2(nowMs)
-        : hapticPatterns.startP1(nowMs, esp_random());
-    if (started && !hapticArray.apply(hapticPatterns.frame())) hapticPatterns.stop();
+                       ? hapticPatterns.startP2(nowMs)
+                       : hapticPatterns.startP1(nowMs, esp_random());
+    if (started && !hapticArray.apply(hapticPatterns.frame()))
+        hapticPatterns.stop();
     lastHapticFrameMs = lastHapticFaultPollMs = nowMs;
-    hapticPatternActive = hapticPatterns.active() || hapticArray.shutdownPending();
+    hapticPatternActive = hapticPatterns.active() || hapticArray.outputStopPending();
     if (hapticPatterns.active())
     {
         Serial.print("[HAPTIC] started ");
@@ -1929,42 +1890,35 @@ void updateStressTriggers(uint32_t nowMs)
         nowMs,
         currentRMSSD,
         isReferenceInputFresh(nowMs) && latestAccelOK && latestGyroOK,
-        motionState == MOTION_LOW,
+        getReferenceMotion(),
         isRmssdStableGate(),
         hapticPatternActive,
-        baselineState == BASELINE_ESTABLISHED,
-        baselineRMSSD};
+        personalBaseline.ready(),
+        personalBaseline.baseline(),
+        sessionCollector.complete(),
+        sessionCollector.median()};
     rmssd::Events events = referenceMonitor.update(input);
 
-    if (events.froze)
-        Serial.println("[Short-term reference] FROZEN");
     if (events.resumed)
-        Serial.println("[Short-term reference] recovery complete - adaptation resumed");
+        Serial.println("[P1/P2] recovery complete - triggers rearmed");
 
     if (events.p1 != rmssd::Source::NONE)
     {
         Serial.print("[P1] TRIGGERED | TriggerSource:");
         Serial.print(rmssd::sourceName(events.p1));
-        Serial.println(" | LongTermBasis:SESSION_BASELINE");
+        Serial.println(" | LongTermBasis:SEVEN_SESSIONS");
     }
     if (events.p2 != rmssd::Source::NONE)
     {
         Serial.print("[P2] TRIGGERED | TriggerSource:");
         Serial.print(rmssd::sourceName(events.p2));
-        Serial.println(" | LongTermBasis:SESSION_BASELINE");
+        Serial.println(" | LongTermBasis:SEVEN_SESSIONS");
         startHapticProtocol(haptics::Protocol::P2_SWEEP, nowMs);
     }
     else if (events.p1 != rmssd::Source::NONE)
     {
         startHapticProtocol(haptics::Protocol::P1_FLUTTER, nowMs);
     }
-}
-
-const char *getStressTriggerStateName()
-{
-    if (referenceMonitor.p2Triggered()) return "P2";
-    if (referenceMonitor.p1Triggered()) return "P1";
-    return "MONITORING";
 }
 
 void processSample(uint32_t green, uint32_t nowMs);
@@ -1989,10 +1943,19 @@ void setup()
     Serial.println("==========================================");
     Serial.println("ESP32-S3 + MAX30101 + BMI270");
     Serial.println("Reference + LMS/Elgendi");
-    Serial.println("LONG_TERM trigger path uses Session baseline (PoC)");
+    Serial.println("LONG_TERM: median of 7 saved startup sessions (prototype, not calendar days)");
+    if (!baselineStore.begin() || !personalBaseline.load(baselineStore))
+        Serial.println("[Personal baseline] STORAGE ERROR; long-term unavailable, session/short paths still enabled");
+    else
+    {
+        Serial.print("[Personal baseline] restored ");
+        Serial.print(personalBaseline.count());
+        Serial.print("/7 sessions | ");
+        Serial.println(personalBaseline.ready() ? "READY" : "long-term path disabled");
+    }
     Serial.print("Post-exercise recovery: ");
     Serial.print(rmssd::POST_EXERCISE_RECOVERY_MS / 1000UL);
-    Serial.println(" seconds of LOW motion");
+    Serial.println(" seconds of LOW motion after HIGH; MODERATE pauses without resetting");
     Serial.println("==========================================");
 
 #if defined(ARDUINO_ARCH_ESP32)
@@ -2003,13 +1966,13 @@ void setup()
 
     Wire.setClock(I2C_SPEED);
     Wire.setTimeOut(10); // Bound failed I2C transfers, including mux branches.
-    delay(2); // DA7280 cold-boot allowance; no delays in the playback sequencer.
+    delay(2);            // DA7280 cold-boot allowance; no delays in the playback sequencer.
     // Sensor initialization continues if the haptic array is absent/faulty.
     if (hapticArray.begin())
         Serial.println("[HAPTIC] 3 x DA7280 ready | M1:CH0 M2:CH1 M3:CH2 | P1:5s P2:60s");
     else
         reportHapticFault();
-    hapticPatternActive = hapticArray.shutdownPending();
+    hapticPatternActive = hapticArray.outputStopPending();
 
     // ========================================================
     // MAX30101
@@ -2242,7 +2205,9 @@ void loop()
         uint32_t motionNowMs = millis();
         updateMotionState(motionNowMs);
         updateLmsFastMotionGate(motionNowMs);
-        referenceMonitor.observeMotion(motionNowMs, motionState == MOTION_LOW);
+        referenceMonitor.observeMotion(motionNowMs, getReferenceMotion());
+        if (motionState != MOTION_LOW)
+            sessionCollector.interrupt();
     }
 
     // ========================================================
@@ -2253,7 +2218,10 @@ void loop()
 
     // A brief invalid period between reports must break continuous holds.
     if (!isReferenceInputFresh(nowMs) || !latestAccelOK || !latestGyroOK)
+    {
         referenceMonitor.interruptContinuity();
+        sessionCollector.interrupt();
+    }
 
     if (nowMs - rateWindowStartMs >= 1000)
     {
@@ -2285,8 +2253,10 @@ void loop()
     {
         // Recompute RMSSD + fold into baseline once per report cycle.
         updateRMSSD(nowMs);
-        updateBaseline(nowMs);
+        updateLmsConvergence(nowMs);
+        updateRmssdStability(nowMs);
         updateStressTriggers(nowMs);
+        updateBaseline(nowMs);
 
         bool lmsValid = isLmsHRValid();
 
@@ -2299,7 +2269,8 @@ void loop()
             Serial.print(lmsHR_smoothed, 1);
             Serial.print("bpm");
         }
-        else Serial.print("--");
+        else
+            Serial.print("--");
 
         Serial.print(" | LMS-IBI:");
         if (latestCleanedIBI > 0 && lmsValid)
@@ -2307,7 +2278,8 @@ void loop()
             Serial.print((uint32_t)roundf(medianRecentLmsIbi()));
             Serial.print("ms");
         }
-        else Serial.print("--");
+        else
+            Serial.print("--");
         newCleanedIBIAvailable = false;
 
         Serial.print(" | Finger:");
@@ -2318,7 +2290,8 @@ void loop()
             Serial.print(currentRMSSD, 1);
             Serial.print("ms");
         }
-        else Serial.print("--");
+        else
+            Serial.print("--");
         Serial.print(" | Motion:");
         Serial.println(getMotionStateName());
         updateHapticActuator(millis());
@@ -2333,27 +2306,24 @@ void loop()
         Serial.println(latestAccelOK && latestGyroOK ? "OK" : "ERROR");
         updateHapticActuator(millis());
 
-        Serial.print("  Reference | Session baseline:");
-        if (baselineState == BASELINE_ESTABLISHED)
+        Serial.print("  Reference | Long-term:");
+        if (personalBaseline.ready())
         {
-            Serial.print(baselineRMSSD, 1);
-            Serial.print("ms");
+            Serial.print(personalBaseline.baseline(), 1);
+            Serial.print("ms (7 sessions)");
         }
         else
+            Serial.print("--");
+        Serial.print(" | SavedSessions:");
+        Serial.print(personalBaseline.count());
+        Serial.print("/7 | DevPct:");
+        if (rmssdValid && personalBaseline.ready())
         {
-            Serial.print("calibrating ");
-            Serial.print(baselineQualifyingMs / 1000UL);
-            Serial.print("/");
-            Serial.print(BASELINE_CALIBRATION_MS / 1000UL);
-            Serial.print("s");
-        }
-        Serial.print(" | DevPct:");
-        if (rmssdValid && baselineState == BASELINE_ESTABLISHED)
-        {
-            Serial.print(getRmssdDeviationPercent(), 1);
+            Serial.print(rmssd::Monitor::deviation(currentRMSSD, personalBaseline.baseline()), 1);
             Serial.print("%");
         }
-        else Serial.print("--");
+        else
+            Serial.print("--");
         Serial.print(" | Short:");
         if (referenceMonitor.shortAvailable())
         {
@@ -2362,9 +2332,8 @@ void loop()
         }
         else Serial.print("--");
         Serial.print(" (");
-        Serial.print(referenceMonitor.frozen() ? "FROZEN" :
-                     referenceMonitor.preliminary() ? "PRELIMINARY" :
-                     referenceMonitor.shortAvailable() ? "READY" : "COLLECTING");
+        Serial.print(referenceMonitor.collectionGate() != rmssd::CollectionGate::OPEN ? "PAUSED" :
+                     referenceMonitor.shortAvailable() ? "ADAPTING" : "COLLECTING");
         Serial.print(") | ShortDevPct:");
         if (rmssdValid && referenceMonitor.shortAvailable())
         {
@@ -2372,7 +2341,48 @@ void loop()
             Serial.print("%");
         }
         else Serial.print("--");
+        Serial.print(" | ShortGate:");
+        Serial.print(rmssd::collectionGateName(referenceMonitor.collectionGate()));
         Serial.println();
+        updateHapticActuator(millis());
+
+        Serial.print("  SessionBaseline:");
+        if (sessionCollector.complete())
+        {
+            Serial.print(sessionCollector.median(), 1);
+            Serial.print("ms (FROZEN)");
+        }
+        else Serial.print("--");
+        Serial.print(" | SessionDevPct:");
+        if (rmssdValid && sessionCollector.complete())
+        {
+            Serial.print(rmssd::Monitor::deviation(currentRMSSD, sessionCollector.median()), 1);
+            Serial.print("%");
+        }
+        else Serial.print("--");
+        Serial.print(" | SessionValid:");
+        Serial.print(sessionCollector.validDurationMs() / 1000UL);
+        Serial.print("/");
+        Serial.print(personal::SESSION_DURATION_MS / 1000UL);
+        Serial.print("s | Samples:");
+        Serial.print(sessionCollector.sampleCount());
+        Serial.print("/");
+        Serial.print(personal::SESSION_SAMPLES);
+        Serial.print(" | State:");
+        if (sessionCollector.complete())
+            Serial.print("FROZEN");
+        else if (referenceMonitor.restingGate() != rmssd::CollectionGate::OPEN)
+        {
+            Serial.print("PAUSED:");
+            Serial.print(rmssd::collectionGateName(referenceMonitor.restingGate()));
+        }
+        else
+            Serial.print(isLmsConvergedGate() ? "COLLECTING" : "PAUSED:LMS_CONVERGENCE");
+        Serial.print(" | Storage:");
+        Serial.println(!personalBaseline.storageReady() ? "ERROR" : baselineSaveError              ? "SAVE_RETRY"
+                                                                : personalBaseline.savedThisBoot() ? "SAVED"
+                                                                : sessionCollector.complete()      ? "PENDING"
+                                                                                                   : "COLLECTING");
         updateHapticActuator(millis());
 
         Serial.print("  Timing | ShortValid:");
@@ -2381,26 +2391,48 @@ void loop()
         Serial.print(rmssd::MIN_SAMPLES * rmssd::SAMPLE_MS / 1000UL);
         Serial.print(", target ");
         Serial.print(rmssd::WINDOW_MS / 1000UL);
-        Serial.print(") | P1[Long/Short]:");
-        Serial.print(referenceMonitor.p1LongHoldMs(nowMs) / 1000UL);
+        Serial.print(") | ShortBlock:");
+        Serial.print(referenceMonitor.sampleBlockMs(nowMs) / 1000.0f, 1);
+        Serial.print("/5s | ShortBreaks:");
+        Serial.print(referenceMonitor.collectionBreaks());
+        Serial.print(" | P1[Session/Short/7Session]:");
+        Serial.print(referenceMonitor.p1SessionHoldMs(nowMs) / 1000UL);
         Serial.print("/");
         Serial.print(referenceMonitor.p1ShortHoldMs(nowMs) / 1000UL);
+        Serial.print("/");
+        Serial.print(referenceMonitor.p1LongHoldMs(nowMs) / 1000UL);
         Serial.print("s of ");
         Serial.print(rmssd::P1_HOLD_MS / 1000UL);
-        Serial.print("s | P2[Long/Short]:");
-        Serial.print(referenceMonitor.p2LongHoldMs(nowMs) / 1000UL);
+        Serial.print("s | P2[Session/Short/7Session]:");
+        Serial.print(referenceMonitor.p2SessionHoldMs(nowMs) / 1000UL);
         Serial.print("/");
         Serial.print(referenceMonitor.p2ShortHoldMs(nowMs) / 1000UL);
+        Serial.print("/");
+        Serial.print(referenceMonitor.p2LongHoldMs(nowMs) / 1000UL);
         Serial.print("s of ");
         Serial.print(rmssd::P2_HOLD_MS / 1000UL);
-        Serial.print("s | Recovery:");
-        Serial.print(referenceMonitor.recoveryHoldMs(nowMs) / 1000UL);
-        Serial.print("/");
-        Serial.print(rmssd::RECOVERY_HOLD_MS / 1000UL);
-        Serial.print("s | PostExercise:");
+        Serial.print("s");
+        if (referenceMonitor.p1Triggered() || referenceMonitor.p2Triggered())
+        {
+            Serial.print(" | Episode:");
+            Serial.print(referenceMonitor.p2Triggered() ? "P2" : "P1");
+            Serial.print(" | Rearm:");
+            Serial.print(referenceMonitor.recoveryHoldMs(nowMs) / 1000UL);
+            Serial.print("/");
+            Serial.print(rmssd::RECOVERY_HOLD_MS / 1000UL);
+            Serial.print("s");
+        }
+        Serial.print(" | PostExercise:");
         Serial.print(referenceMonitor.postExerciseRecovery() ? "Y" : "N");
-        Serial.print(" | State:");
-        Serial.print(getStressTriggerStateName());
+        if (referenceMonitor.postExerciseRecovery())
+        {
+            Serial.print("(");
+            Serial.print((referenceMonitor.motionRecoveryRemainingMs(nowMs) + 999UL) / 1000UL);
+            Serial.print("s LOW remaining");
+            if (motionState == MOTION_MODERATE)
+                Serial.print(", PAUSED");
+            Serial.print(")");
+        }
         Serial.print(" | Haptic:");
         Serial.print(getHapticStateName());
         if (hapticPatterns.active())
@@ -2568,6 +2600,7 @@ void processSample(
     if (nowPresent != fingerPresent)
     {
         referenceMonitor.contactChanged();
+        sessionCollector.interrupt();
         resetReferenceBeatState();
 
         resetElgendiState();

@@ -1,100 +1,162 @@
-# RMSSD references in the PoC
+﻿# RMSSD references in the prototype
 
-The existing 60-second RMSSD calculation, beat detector, and five-minute frozen
-resting baseline are retained. The latter is now displayed as **Session
-baseline**. It still averages one RMSSD reading every five seconds during five
-qualifying minutes and pauses when its existing qualification gates fail.
+Current RMSSD uses the existing 60-second interval window and beat detector.
+P1/P2 has three independent comparison paths:
 
-The `LONG_TERM` trigger source currently means this session-baseline substitute.
-Event logs also print `LongTermBasis:SESSION_BASELINE` to make that distinction
-explicit. No daily measurements, calendar clock, persistent baseline, or
-seven-day readiness state are implemented in this PoC.
+| Reference | Becomes available | Behaviour |
+|---|---|---|
+| Session baseline | 100 qualifying seconds in this startup | Median of 20 readings; frozen for this startup |
+| Short reference | 60 qualifying seconds in the latest five minutes | Median of up to 60 recent readings; keeps adapting |
+| Long-term personal baseline | Seven successfully saved startup sessions | Median of the latest seven frozen session medians; persisted in flash |
 
-## Short-term reference
+The session path works as soon as this startup's session baseline completes,
+even before seven saved sessions. Before that, the short path can work alone.
+An established seven-session baseline is restored and available at startup.
+Sessions simulate days for prototype testing; no calendar dates are used.
 
-- Median of up to 60 RMSSD readings from the preceding five wall-clock minutes.
-- One reading is admitted after each complete five-second qualifying block.
-  A block requires LOW motion, fresh valid LMS-HR and RMSSD, stable RMSSD,
-  no intervention or active P1/P2 condition/episode, and no motion recovery.
-- At least 36 such blocks (three valid minutes) are required. Collection
-  continues toward 60 readings; invalid periods do not count as valid time.
-- Old readings expire even during invalid input or a frozen episode. The
-  frozen reference is a separate snapshot and does not expire mid-episode.
-- A positive reference is required for percentage comparisons. A current
-  RMSSD of zero remains a valid input when the upstream validity gate permits it.
-- Input freshness requires an accepted RMSSD interval within three seconds,
-  valid LMS-HR, and successful accelerometer/gyro reads. A report gap exceeding
-  2.5 seconds breaks continuous timers; elapsed time without observations does
-  not count toward sample collection or trigger holds.
+## Current session and saved sessions
 
-`POST_EXERCISE_RECOVERY_MS` in `lib/RmssdReferences/RmssdReferences.h` defaults to
-120 seconds of continuous LOW motion after any confirmed MODERATE/HIGH motion.
-Renewed motion restarts that wait. This conservative PoC rule blocks reference
-collection, trigger timers, and unfreezing during recovery. It does not attempt
-to infer a physiological end to exercise from HR.
+Each startup collects one reading after each complete five-second block of LOW
+motion, fresh valid LMS-HR/RMSSD, successful IMU reads, stable RMSSD and converged
+LMS. Post-exercise recovery and active haptic output block collection. Pending
+triggers and episode latches do not block otherwise qualifying resting data.
 
-## Freeze, triggers, and recovery
+Completed session blocks accumulate without expiring. Signal/contact/motion
+interruptions discard an incomplete block; report gaps over 2.5 seconds cannot
+count as observed data. At 20 readings (100 qualifying seconds), the session
+median freezes. Later readings and contact changes cannot change it. A new
+startup begins a new session measurement.
 
-A drop of at least 10% below the short reference starts a preliminary hold.
-Collection pauses immediately, holding that reference constant during the
-decision period. After ten continuous qualifying seconds, the reference is
-marked `FROZEN`. This alone does not trigger a haptic intervention. Loss of the
-preliminary condition before ten seconds cancels the hold.
+`SavedSessions` receives exactly that frozen session median once per startup,
+never the changing short reference. Staying powered on cannot contribute another
+value. Resets and firmware-upload restarts are new startup opportunities, but
+only completed measurements count. After seven saves, each completed startup
+replaces the oldest saved value. Changing the long-term median resets its pending
+trigger holds so elapsed time cannot carry across a reference change.
 
-Each reference has its own P1 timer (at least 20% for 30 continuous seconds) and
-P2 timer (at least 30% for 120 continuous seconds). A short-path timer may start
-during the preliminary hold against the same held value, but can trigger only
-after freezing. Thus a sustained 20% drop can trigger P1 at 30 seconds, without
-adding another ten seconds. RMSSD stability gates reference updates and recovery,
-but is not required while timing a drop.
+## Persistence
 
-Either independently completed path triggers the corresponding level. Sources
-are `LONG_TERM`, `SHORT_TERM`, or `BOTH`; `BOTH` means both paths completed that
-level's duration at the firing time. P1 and P2 retain separate source records.
-One path's partial hold cannot be transferred to the other. Each level fires
-at most once per episode. P2 takes actuator priority if both levels fire together.
-The three-motor actuation sequences and DA7280/mux mapping are described in
-[haptic-protocols.md](haptic-protocols.md).
+`src/NvsBaselineStore.h` uses ESP32 Preferences/NVS in namespace `sutra-baseline`.
+Alternating `history0` and `history1` records contain seven medians, ring position,
+count, version, generation and CRC32. Writes are committed and verified by reading
+back before in-memory history advances. The previous slot remains a fallback if
+the newest record is corrupt or incomplete. Writes occur once per completed
+startup measurement, not once per sensor sample.
 
-The reference stays frozen throughout the episode and intervention. A freeze
-before P1 clears after 60 continuous seconds of stable, qualified recovery below
-10% deviation from the short reference, with no pending P1/P2 condition. After
-P1/P2, both available references must be below 10% for the same recovery period.
-An active haptic pattern blocks recovery completion. At exactly 10%, recovery
-does not qualify.
+Saved sessions survive resets, power-off and battery discharge. An unfinished
+session measurement and the short buffer live in RAM and restart after power
+loss. This project's USB/esptool uploads now use `--erase-all`: each upload clears
+all flash, including saved sessions, before programming. This also applies when
+re-uploading an unchanged binary. Ordinary resets and power cycles retain history.
+The 100-second session duration is a shortened prototype testing setting.
 
-Invalid input or motion resets partial holds but preserves the frozen reference
-and fired-level latches. Contact changes clear the rolling readings and partial
-holds, while preserving any frozen episode. The retained session baseline follows
-its existing reset behavior. When adaptation resumes, only unexpired rolling
-readings may be reused; a long episode can require a fresh three-minute collection.
+If neither existing record is valid or storage cannot be read, `Storage:ERROR`
+leaves long-term detection unavailable without silently overwriting history.
+Session and short detection can still operate. A failed save reports `SAVE_RETRY`
+and retries no more than once per ten seconds when resting quality permits,
+using the same frozen session median and preserving previous saved history.
 
-Serial output is grouped into four lines per report: timestamped readings,
-quality/convergence, references/deviations, and timing/state. `DevPct` refers to
-the session baseline; `ShortDevPct` refers to the short reference. `ShortValid`
-describes the unexpired rolling readings, so it may decrease while a frozen
-snapshot remains usable. P1/P2 timers show Long/Short elapsed seconds and their
-required duration. Trigger sources are printed in the P1/P2 event messages.
-Detailed reference-detector, filter, raw IMU, temperature, and startup-parameter
-prints are commented out in `src/main.cpp` for optional troubleshooting.
+## Adapting short reference
 
-## Future seven-day baseline
+One reading is stored per complete five-second qualifying block and expires at
+age five minutes. At least 12 retained readings (60 qualifying seconds) are
+needed. Collection continues toward 60 readings. Unlike session collection, short
+collection does not require LMS convergence separately from the fresh-signal and
+RMSSD-stability checks. A positive reference is needed for percentage comparisons.
 
-The session baseline can later be supplemented or replaced with the median of
-the latest seven valid daily resting values, each based on at least five valid
-minutes under consistent morning or sleep/rest conditions. That implementation
-needs daily measurement selection, dates and persistence. Readiness should be
-`UNAVAILABLE` below three valid days, `PROVISIONAL` at three to six, and
-`ESTABLISHED` with seven valid days. It must remain separate from the rolling
-short-term reference.
+The short reference adapts through pending triggers and episode recovery whenever
+resting quality gates pass. There is no preliminary 10% freeze or frozen short
+snapshot. Active haptics, invalid/stale data, unstable RMSSD, non-LOW motion and
+post-exercise recovery pause collection. Readings keep expiring during pauses,
+so `ShortValid` can decrease. Contact changes clear the short buffer but retain
+episode latches, the completed session baseline and saved history.
 
-## Validation
+P1/P2 compares directly against the current live median. If adaptation reduces
+deviation below a trigger threshold, that path's pending hold resets. The fixed
+session baseline provides a separate comparison for sustained drops.
+
+## Motion and recovery
+
+HIGH motion starts/restarts a 60-second LOW-motion recovery requirement after
+recovery is armed by the first qualifying resting block. Startup motion before
+that block does not start post-exercise recovery. MODERATE never starts or resets
+this wait; it pauses the countdown and preserves accrued LOW time. LOW resumes
+it. Unobserved time does not count. Both MODERATE and HIGH interrupt collection
+blocks and P1/P2 continuous holds.
+
+## P1/P2 logic
+
+Each available reference has its own continuous timers:
+
+- P1: current RMSSD at least 20% below that reference for 30 seconds.
+- P2: current RMSSD at least 30% below that reference for 120 seconds.
+
+One completed path suffices; elapsed time cannot transfer between paths. Invalid
+input, non-LOW motion or post-exercise recovery breaks holds. RMSSD stability is
+required for adaptation and episode recovery, but not for timing a drop. Each
+level fires once per episode; P2 takes haptic priority.
+
+Sources identify `SESSION`, `SHORT_TERM`, `LONG_TERM`, or explicit combinations
+such as `SESSION+SHORT_TERM`. `LONG_TERM` means the seven-session personal value,
+not the individual current-session baseline.
+
+After an episode, rearm after 60 continuous seconds of stable, qualified recovery
+with less than 10% drop against every available reference, at least one reference
+available, and no active intervention. Exactly 10% does not qualify. The short
+reference continues adapting during recovery when quality permits.
+
+## Serial output
+
+- `SessionBaseline:<value>ms (FROZEN)` after completion; `--` while collecting.
+- `SessionValid:50/100s | Samples:10/20` shows this startup's progress.
+- `State:COLLECTING`, `PAUSED:<reason>` or `FROZEN`; `Storage:SAVED` confirms saving.
+- `SavedSessions:0/7` through `7/7` and `Long-term:<value>ms` once established.
+- `SessionDevPct`, `ShortDevPct`, and `DevPct` compare against session, live short,
+  and seven-session personal values, respectively.
+- Short status is `ADAPTING`, `COLLECTING`, or `PAUSED`; `ShortGate` shows the
+  blocker. `ShortBlock` and `ShortBreaks` show block progress and interruptions,
+  including interruptions that clear between reports.
+- `P1[Session/Short/7Session]` and `P2[Session/Short/7Session]` show independent timers.
+  `PostExercise` shows remaining LOW time, with `PAUSED` on MODERATE.
+- The idle `State:MONITORING` field is omitted. After a trigger, `Episode:P1/P2`
+  and `Rearm:0/60s` appear until recovery completes. Rearming needs 60 seconds of
+  stable, qualified data below 10% drop against all available references, with
+  no active haptics. This is separate from post-exercise recovery.
+
+## LMS convergence and RMSSD stability
+
+LMS convergence checks 20 once-per-second filter-weight observations, smoothed
+with an EMA factor of 0.2. The maximum minus minimum must be at most 20 weight
+units for ten seconds. Earliest convergence is roughly 30 seconds after reset
+with settled data; drifting weights take longer. Five seconds outside the range
+loses convergence. Finger-contact changes reset the convergence history.
+
+RMSSD stability uses a three-reading median pre-filter only for this check, then
+20 valid readings sampled at most once per second. Their range must be no more
+than the larger of 8 ms or 12% of their mean for ten seconds. At a mean of 100 ms,
+the allowed range is 12 ms. Roughly 30 seconds of steady valid RMSSD can establish
+stability from empty history; five seconds outside the range loses it. Invalid
+RMSSD pauses this check without resetting its history/hold timestamps, so these
+are not strictly continuous valid-data windows across gaps. Independent fresh
+signal gates still prevent invalid/stale data from entering baseline collection.
+
+Beat-timing changes, motion/contact noise, missed or extra detections, artifact
+rejections, and readings entering/leaving the 60-second RMSSD window affect its
+range. The stability flag itself tests RMSSD range, not motion or convergence;
+baseline collection checks those conditions separately. Finger-contact changes
+reset stability history. A stable number does not establish measurement accuracy.
+
+`Haptic:FAULT_STOP_PENDING` blocks collection if shutdown of commanded output is
+uncertain. Startup-unavailable haptics show `FAULT` and allow collection. See
+[haptic-protocols.md](haptic-protocols.md) for actuation details.
+
+## Validation and future daily baseline
 
 Firmware: `pio run -e seeed_xiao_esp32s3`
 
-Deterministic host tests through PlatformIO:
-`pio test -c platformio-test.ini -e native`
+Host tests: `pio test -c platformio-test.ini -e native`
 
-The separate test configuration does not change the firmware's target environment.
-Tests use simulated time and readings; they do not validate sensor accuracy or
-physical haptic behavior.
+Tests simulate readings, timing, storage and I2C. Sensor accuracy, physical
+actuation and actual battery-loss recovery require hardware testing. A future
+calendar-day implementation needs dates and consistent daily measurement
+selection; seven startup sessions do not establish seven days of data.

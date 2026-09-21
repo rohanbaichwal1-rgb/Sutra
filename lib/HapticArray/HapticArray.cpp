@@ -137,9 +137,11 @@ bool Array::apply(const Frame &frame)
             if (!driving_[motor] && next > 0)
             {
                 // Initial amplitude is set before entering DRO playback.
+                // Mark BEFORE the transfer: a lost acknowledgement does not
+                // prove that the driver ignored the playback command.
+                driving_[motor] = true;
                 if (!writeReg(reg::TOP_CTL1, 0x01))
                     return fail(ArrayError::I2C, motor + 1);
-                driving_[motor] = true;
             }
             levels_[motor] = next;
         }
@@ -178,6 +180,14 @@ bool Array::pollFaults()
     }
     if (!disconnect()) return fail(ArrayError::I2C);
     return true;
+}
+
+bool Array::outputStopPending() const
+{
+    if (!shutdownPending_) return false;
+    for (unsigned motor = 0; motor < MOTOR_COUNT; ++motor)
+        if (driving_[motor]) return true;
+    return false;
 }
 
 bool Array::stopAll()

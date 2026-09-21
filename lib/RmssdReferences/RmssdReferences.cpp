@@ -3,13 +3,31 @@
 
 namespace rmssd
 {
+const char *collectionGateName(CollectionGate gate)
+{
+    switch (gate)
+    {
+    case CollectionGate::OPEN: return "OPEN";
+    case CollectionGate::SIGNAL_OR_IMU: return "SIGNAL_OR_IMU";
+    case CollectionGate::MOTION: return "MOTION";
+    case CollectionGate::POST_EXERCISE: return "POST_EXERCISE";
+    case CollectionGate::UNSTABLE: return "RMSSD_UNSTABLE";
+    case CollectionGate::INTERVENTION: return "HAPTIC_ACTIVE_OR_STOP_PENDING";
+    }
+    return "UNKNOWN";
+}
+
 const char *sourceName(Source source)
 {
     switch (source)
     {
     case Source::LONG_TERM: return "LONG_TERM";
     case Source::SHORT_TERM: return "SHORT_TERM";
-    case Source::BOTH: return "BOTH";
+    case Source::BOTH: return "LONG_TERM+SHORT_TERM";
+    case Source::SESSION: return "SESSION";
+    case Source::LONG_AND_SESSION: return "LONG_TERM+SESSION";
+    case Source::SHORT_AND_SESSION: return "SESSION+SHORT_TERM";
+    case Source::ALL: return "LONG_TERM+SESSION+SHORT_TERM";
     default: return "NONE";
     }
 }
@@ -33,34 +51,57 @@ float Monitor::deviation(float current, float reference)
 
 void Monitor::interruptContinuity()
 {
+    if (sampleBlock_.active) ++collectionBreaks_;
     sampleBlock_.active = false;
-    preliminary_.active = false;
     recovery_.active = false;
     p1Long_.active = p1Short_.active = false;
     p2Long_.active = p2Short_.active = false;
+    p1Session_.active = p2Session_.active = false;
+}
+
+uint32_t Monitor::motionRecoveryRemainingMs(uint32_t now) const
+{
+    (void)now; // only observed LOW intervals count, not time since a report
+    if (!motionRecovery_) return 0;
+    return POST_EXERCISE_RECOVERY_MS - recoveryLowMs_;
 }
 
 void Monitor::contactChanged()
 {
     interruptContinuity();
     head_ = count_ = 0;
-    if (!frozen_) { shortReady_ = false; shortValue_ = 0.0f; }
+    shortReady_ = false;
+    shortValue_ = 0.0f;
 }
 
-void Monitor::observeMotion(uint32_t now, bool lowMotion)
+void Monitor::observeMotion(uint32_t now, Motion motion)
 {
-    if (!lowMotion)
+    if (motionRecovery_ && haveMotion_ &&
+        previousMotion_ == Motion::LOW_MOTION && motion == Motion::LOW_MOTION)
     {
-        motionRecovery_ = true;
-        lowMotion_.active = false;
-        interruptContinuity();
+        uint32_t elapsed = now - lastMotionMs_;
+        // Do not credit a gap with no motion observations.
+        if (elapsed <= MAX_REPORT_GAP_MS)
+        {
+            uint32_t remaining = POST_EXERCISE_RECOVERY_MS - recoveryLowMs_;
+            recoveryLowMs_ += elapsed < remaining ? elapsed : remaining;
+        }
     }
-    else if (motionRecovery_)
+    haveMotion_ = true;
+    previousMotion_ = motion;
+    lastMotionMs_ = now;
+
+    if (motion == Motion::HIGH_MOTION)
     {
-        lowMotion_.update(true, now);
-        if (lowMotion_.reached(now, POST_EXERCISE_RECOVERY_MS))
-            motionRecovery_ = false;
+        if (motionRecoveryArmed_) motionRecovery_ = true;
+        recoveryLowMs_ = 0;
     }
+    else if (motion == Motion::LOW_MOTION && recoveryLowMs_ >= POST_EXERCISE_RECOVERY_MS)
+        motionRecovery_ = false;
+
+    // MODERATE pauses recovery without starting it or discarding LOW time.
+    // Both movement levels still interrupt collection and P1/P2 holds.
+    if (motion != Motion::LOW_MOTION) interruptContinuity();
 }
 
 void Monitor::expire(uint32_t now)
@@ -102,106 +143,88 @@ void Monitor::append(float value, uint32_t now)
     calculateMedian();
 }
 
-void Monitor::freeze(Events &events)
-{
-    if (!frozen_ && shortReady_)
-    {
-        frozen_ = true;
-        events.froze = true;
-    }
-}
-
-static Source completed(const Hold &longHold, const Hold &shortHold,
-                        bool frozen, uint32_t now, uint32_t duration)
+static Source completed(const Hold &longHold, const Hold &shortHold, const Hold &sessionHold,
+                        uint32_t now, uint32_t duration)
 {
     unsigned mask = longHold.reached(now, duration) ? 1 : 0;
-    if (frozen && shortHold.reached(now, duration)) mask |= 2;
+    if (shortHold.reached(now, duration)) mask |= 2;
+    if (sessionHold.reached(now, duration)) mask |= 4;
     return static_cast<Source>(mask);
 }
 
 Events Monitor::update(const Input &in)
 {
     Events events;
-    observeMotion(in.now, in.lowMotion);
-    if (haveReport_ && in.now - lastReport_ > MAX_REPORT_GAP_MS)
-        interruptContinuity();
+    observeMotion(in.now, in.motion);
+    if (haveReport_ && in.now - lastReport_ > MAX_REPORT_GAP_MS) interruptContinuity();
     haveReport_ = true;
     lastReport_ = in.now;
-
-    // The ring always ages in wall time. A frozen (or pending transition)
-    // snapshot is separate and can survive a long intervention.
     expire(in.now);
-    if (!frozen_ && !preliminary_.active) calculateMedian();
+    calculateMedian();
 
     bool valid = in.signalGood && isfinite(in.current) && in.current >= 0.0f;
-    bool qualifies = valid && in.lowMotion && !motionRecovery_;
-    bool sessionReady = in.sessionAvailable && isfinite(in.sessionBaseline) &&
-                        in.sessionBaseline > 0.0f;
-    float sessionDrop = deviation(in.current, in.sessionBaseline);
-    float shortDrop = deviation(in.current, shortValue_);
+    bool qualifies = valid && in.motion == Motion::LOW_MOTION && !motionRecovery_;
+    if (!valid) restingGate_ = CollectionGate::SIGNAL_OR_IMU;
+    else if (in.motion != Motion::LOW_MOTION) restingGate_ = CollectionGate::MOTION;
+    else if (motionRecovery_) restingGate_ = CollectionGate::POST_EXERCISE;
+    else if (in.interventionActive) restingGate_ = CollectionGate::INTERVENTION;
+    else if (!in.stable) restingGate_ = CollectionGate::UNSTABLE;
+    else restingGate_ = CollectionGate::OPEN;
 
-    // Stop collecting immediately during the preliminary hold so the median
-    // cannot follow the drop during the ten seconds before confirmed freezing.
-    preliminary_.update(qualifies && shortReady_ && !frozen_ && shortDrop >= 10.0f, in.now);
-    if (preliminary_.reached(in.now, FREEZE_HOLD_MS)) freeze(events);
-
-    p1Long_.update(qualifies && sessionReady && sessionDrop >= 20.0f, in.now);
-    p2Long_.update(qualifies && sessionReady && sessionDrop >= 30.0f, in.now);
-    // Count the initial ten seconds against the same held reference, but only
-    // allow a short-path trigger once the freeze has been confirmed.
-    p1Short_.update(qualifies && shortReady_ && shortDrop >= 20.0f, in.now);
-    p2Short_.update(qualifies && shortReady_ && shortDrop >= 30.0f, in.now);
-
-    if (!p1Fired_)
-    {
-        events.p1 = completed(p1Long_, p1Short_, frozen_, in.now, P1_HOLD_MS);
-        if (events.p1 != Source::NONE)
-        {
-            p1Fired_ = true;
-            p1Source_ = events.p1;
-            freeze(events);
-        }
-    }
-    if (!p2Fired_)
-    {
-        events.p2 = completed(p2Long_, p2Short_, frozen_, in.now, P2_HOLD_MS);
-        if (events.p2 != Source::NONE)
-        {
-            p2Fired_ = true;
-            p2Source_ = events.p2;
-            freeze(events);
-        }
-    }
-
-    bool triggered = p1Fired_ || p2Fired_;
-    bool recovering = frozen_ || triggered;
-    // Before P1, recover against the short reference. After an intervention,
-    // both available references must recover to avoid immediately re-arming
-    // the still-depressed alternate path.
-    bool recovered = (!shortReady_ || shortDrop < 10.0f) &&
-                     (!triggered || !sessionReady || sessionDrop < 10.0f);
-    bool pendingTrigger = p1Long_.active || p1Short_.active ||
-                          p2Long_.active || p2Short_.active;
-    recovery_.update(recovering && qualifies && in.stable && recovered &&
-                     !pendingTrigger && !in.interventionActive, in.now);
-    if (recovery_.reached(in.now, RECOVERY_HOLD_MS))
-    {
-        frozen_ = false;
-        p1Fired_ = p2Fired_ = false;
-        p1Source_ = p2Source_ = Source::NONE;
-        interruptContinuity();
-        calculateMedian(); // expired samples cannot initialize a new reference
-        events.resumed = true;
-    }
-
-    bool canCollect = qualifies && in.stable && !frozen_ &&
-                      !preliminary_.active && !p1Fired_ && !p2Fired_ &&
-                      !pendingTrigger && !in.interventionActive;
+    // The live short reference continues collecting through pending triggers
+    // and latched episodes. Only the resting quality gates pause adaptation.
+    collectionGate_ = restingGate_;
+    bool canCollect = collectionGate_ == CollectionGate::OPEN;
+    if (!canCollect && sampleBlock_.active) ++collectionBreaks_;
     sampleBlock_.update(canCollect, in.now);
     if (sampleBlock_.reached(in.now, SAMPLE_MS))
     {
         append(in.current, in.now);
+        motionRecoveryArmed_ = true;
         sampleBlock_.since = in.now;
+    }
+
+    bool longReady = in.longTermAvailable && isfinite(in.longTermBaseline) && in.longTermBaseline > 0;
+    bool sessionReady = in.sessionAvailable && isfinite(in.sessionBaseline) && in.sessionBaseline > 0;
+    // A newly saved personal baseline must not inherit another value's hold.
+    float longValue = longReady ? in.longTermBaseline : 0;
+    float sessionValue = sessionReady ? in.sessionBaseline : 0;
+    if (longValue != lastLongBaseline_) p1Long_.active = p2Long_.active = false;
+    if (sessionValue != lastSessionBaseline_) p1Session_.active = p2Session_.active = false;
+    lastLongBaseline_ = longValue;
+    lastSessionBaseline_ = sessionValue;
+    float longDrop = deviation(in.current, longValue);
+    float sessionDrop = deviation(in.current, sessionValue);
+    float shortDrop = deviation(in.current, shortValue_);
+
+    p1Long_.update(qualifies && longReady && longDrop >= 20, in.now);
+    p2Long_.update(qualifies && longReady && longDrop >= 30, in.now);
+    p1Session_.update(qualifies && sessionReady && sessionDrop >= 20, in.now);
+    p2Session_.update(qualifies && sessionReady && sessionDrop >= 30, in.now);
+    p1Short_.update(qualifies && shortReady_ && shortDrop >= 20, in.now);
+    p2Short_.update(qualifies && shortReady_ && shortDrop >= 30, in.now);
+    if (!p1Fired_)
+    {
+        events.p1 = completed(p1Long_, p1Short_, p1Session_, in.now, P1_HOLD_MS);
+        if (events.p1 != Source::NONE) { p1Fired_ = true; p1Source_ = events.p1; }
+    }
+    if (!p2Fired_)
+    {
+        events.p2 = completed(p2Long_, p2Short_, p2Session_, in.now, P2_HOLD_MS);
+        if (events.p2 != Source::NONE) { p2Fired_ = true; p2Source_ = events.p2; }
+    }
+    bool recovered = (shortReady_ || sessionReady || longReady) &&
+                     (!shortReady_ || shortDrop < 10) &&
+                     (!sessionReady || sessionDrop < 10) &&
+                     (!longReady || longDrop < 10);
+    recovery_.update((p1Fired_ || p2Fired_) && qualifies && in.stable &&
+                     recovered && !in.interventionActive, in.now);
+    if (recovery_.reached(in.now, RECOVERY_HOLD_MS))
+    {
+        p1Fired_ = p2Fired_ = false;
+        p1Source_ = p2Source_ = Source::NONE;
+        recovery_.active = false;
+        events.resumed = true;
     }
     return events;
 }

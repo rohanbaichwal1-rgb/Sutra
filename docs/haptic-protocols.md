@@ -68,16 +68,22 @@ toward or away from P6.
 
 The compact report shows `Haptic:OFF`, `P1_FLUTTER`, or `P2_SWEEP`, plus elapsed
 and total intervention seconds. Protocol starts/completion and hardware errors
-are separate event lines. Existing reference freezing/recovery sees the entire
+are separate event lines. Reference collection/recovery sees the entire
 intervention as active, including gaps between taps.
 
 Driver fault registers are checked before starting and every 100 ms while
 playing. I2C failures and motor/temperature faults stop the sequence and attempt
 zero-amplitude/inactive writes on all three channels. Faults latch until reboot.
-If a stop cannot be acknowledged, `FAULT_STOP_PENDING` is displayed and stop
-writes are retried every 250 ms; reference adaptation stays blocked while output
-shutdown is uncertain. Software cannot guarantee stopping an unreachable powered
-driver. The I2C transfer timeout is bounded at 10 ms.
+Failed stop writes are retried every 250 ms. `FAULT_STOP_PENDING` is displayed
+and reference adaptation stays blocked if a motor commanded into playback has
+not acknowledged shutdown. Playback is tracked before sending the start command,
+so losing its acknowledgement also requires a confirmed stop. A startup failure
+before any playback command displays `FAULT` and does not count as an active
+intervention: missing haptic hardware no longer prevents short-reference
+collection. Haptics stay disabled until reboot. Software cannot guarantee
+stopping an unreachable powered driver; the playback tracking is local to this
+firmware run and is not a measurement of physical vibration. The I2C transfer
+timeout is bounded at 10 ms.
 
 ## Files and validation
 
