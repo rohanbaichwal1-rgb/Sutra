@@ -42,6 +42,7 @@
 #include <HapticPatterns.h>
 #include "HapticWireBus.h"
 #include "NvsBaselineStore.h"
+#include "BleTelemetry.h"
 #include <esp_system.h>
 
 rmssd::Monitor referenceMonitor;
@@ -1927,6 +1928,19 @@ void processSample(uint32_t green, uint32_t nowMs);
 // SETUP
 // ============================================================
 
+// Keep a failed startup visible even when the monitor connects after boot.
+// Do not enter measurement/actuation with a required sensor unavailable.
+[[noreturn]] void reportStartupFailure(const char *message)
+{
+    while (true)
+    {
+        Serial.print("[STARTUP ERROR] ");
+        Serial.print(message);
+        Serial.println(" | Check power/SDA/SCL and press RESET.");
+        delay(2000);
+    }
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -1968,6 +1982,7 @@ void setup()
     Wire.setTimeOut(10); // Bound failed I2C transfers, including mux branches.
     delay(2);            // DA7280 cold-boot allowance; no delays in the playback sequencer.
     // Sensor initialization continues if the haptic array is absent/faulty.
+    Serial.println("[Startup] Checking haptic mux/drivers...");
     if (hapticArray.begin())
         Serial.println("[HAPTIC] 3 x DA7280 ready | M1:CH0 M2:CH1 M3:CH2 | P1:5s P2:60s");
     else
@@ -1978,12 +1993,9 @@ void setup()
     // MAX30101
     // ========================================================
 
+    Serial.println("[Startup] Checking MAX3010x...");
     if (!particleSensor.begin(Wire, I2C_SPEED))
-    {
-        Serial.println("MAX3010x not found.");
-        while (1)
-            delay(1000);
-    }
+        reportStartupFailure("MAX3010x not found at 0x57");
 
     byte powerLevel = 0xFF;
 
@@ -2029,12 +2041,7 @@ void setup()
     cfg.i2cHz = I2C_SPEED;
 
     if (!imu.begin(cfg))
-    {
-        Serial.println("BMI270 FAILED");
-
-        while (1)
-            delay(1000);
-    }
+        reportStartupFailure("BMI270 initialization failed at 0x69");
 
     Serial.println("BMI270 SUCCESS");
 
@@ -2119,6 +2126,7 @@ void setup()
     // Serial.println("==========================================");
     // Serial.println();
 
+    Serial.println(telemetry::begin() ? "[BLE] Starting Sutra telemetry" : "[BLE] Task allocation failed");
     tsLastReport = millis();
     rateWindowStartMs = millis();
 }
@@ -2129,6 +2137,14 @@ void setup()
 
 void loop()
 {
+    static uint32_t previousLoopUs = 0;
+    static uint32_t maxLoopGapUs = 0;
+    const uint32_t loopUs = micros();
+    if (previousLoopUs != 0) {
+        const uint32_t gap = loopUs - previousLoopUs;
+        if (gap > maxLoopGapUs) maxLoopGapUs = gap;
+    }
+    previousLoopUs = loopUs;
     // Run the actuator state machine on every pass without blocking.
     updateHapticActuator(millis());
 
@@ -2259,6 +2275,21 @@ void loop()
         updateBaseline(nowMs);
 
         bool lmsValid = isLmsHRValid();
+        const bool fresh = isReferenceInputFresh(nowMs);
+        telemetry::Snapshot snapshot = {
+            lmsValid ? lmsHR_smoothed : NAN,
+            lmsValid && latestCleanedIBI > 0 ? medianRecentLmsIbi() : NAN,
+            fresh ? currentRMSSD : NAN,
+            sessionCollector.complete() ? sessionCollector.median() : NAN,
+            referenceMonitor.shortAvailable() ? referenceMonitor.shortReference() : NAN,
+            personalBaseline.ready() ? personalBaseline.baseline() : NAN,
+            nowMs / 1000UL, maxLoopGapUs,
+            static_cast<uint8_t>(fingerPresent), static_cast<uint8_t>(motionState),
+            static_cast<uint8_t>(isLmsConvergedGate()), static_cast<uint8_t>(isRmssdStableGate()),
+            static_cast<uint8_t>(fresh), static_cast<uint8_t>(personalBaseline.count()),
+            static_cast<uint8_t>(referenceMonitor.p2Triggered() ? 2 : referenceMonitor.p1Triggered() ? 1 : 0)
+        };
+        telemetry::publish(snapshot);
 
         // One compact group per report: readings, quality, references, timers.
         Serial.print("[");
@@ -2293,7 +2324,13 @@ void loop()
         else
             Serial.print("--");
         Serial.print(" | Motion:");
-        Serial.println(getMotionStateName());
+        Serial.print(getMotionStateName());
+        Serial.print(" | BLE:");
+        Serial.print(telemetry::state());
+        Serial.print(" | LoopMax:");
+        Serial.print(maxLoopGapUs / 1000.0f, 1);
+        Serial.println("ms");
+        maxLoopGapUs = 0;
         updateHapticActuator(millis());
 
         Serial.print("  Quality | LMSconverged:");
