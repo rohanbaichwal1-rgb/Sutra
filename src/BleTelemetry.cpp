@@ -3,7 +3,7 @@
 #include <BLEDevice.h>
 #include <BLE2902.h>
 #include <atomic>
-#include <math.h>
+#include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
@@ -15,34 +15,43 @@
 namespace telemetry {
 namespace {
 constexpr const char *SERVICE_UUID = "7d2a0000-8f5a-4b10-9b6d-6f7574726100";
-constexpr unsigned VALUE_COUNT = 8;
-// Preserve existing UUIDs for status and timing after removing battery telemetry.
-constexpr unsigned VALUE_IDS[VALUE_COUNT] = {1, 2, 3, 4, 5, 6, 8, 9};
+constexpr unsigned VALUE_COUNT = static_cast<unsigned>(Group::COUNT);
 QueueHandle_t snapshots = nullptr;
 std::atomic<bool> ready{false}, connected{false}, restartAdvertising{false};
 std::atomic<bool> failed{false};
 BLECharacteristic *values[VALUE_COUNT] = {};
+BLECharacteristic *stream = nullptr;
+BLE2902 *subscription = nullptr;
+std::atomic<uint16_t> peerMtu{23};
 
 class ConnectionCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer *) override { connected.store(true); }
+    void onConnect(BLEServer *) override {
+        peerMtu.store(23);
+        connected.store(true);
+    }
     void onDisconnect(BLEServer *) override {
         connected.store(false);
+        peerMtu.store(23);
+        subscription->setNotifications(false);
         restartAdvertising.store(true);
+    }
+    void onMtuChanged(BLEServer *, esp_ble_gatts_cb_param_t *param) override {
+        peerMtu.store(param->mtu.mtu);
     }
 };
 ConnectionCallbacks callbacks;
 
-void send(unsigned index, const char *text) {
-    values[index]->setValue(std::string(text));
-    if (connected.load()) values[index]->notify(); // no indication/ack wait
-}
-
-void number(unsigned index, float value) {
-    char text[21];
-    if (isfinite(value) && value >= 0 && value < 100000)
-        snprintf(text, sizeof(text), "%.1f", value);
-    else snprintf(text, sizeof(text), "--");
-    send(index, text);
+void sendLine(const char *text) {
+    size_t remaining = strlen(text);
+    while (remaining && connected.load() && subscription->getNotifications()) {
+        const size_t count = notificationChunkSize(remaining, peerMtu.load());
+        stream->setValue(reinterpret_cast<uint8_t *>(const_cast<char *>(text)), count);
+        stream->notify(); // no indication/ack wait; only this worker sends
+        text += count;
+        remaining -= count;
+        // Pace traffic on core 0, never in the sensor loop.
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
 
 void worker(void *) {
@@ -52,29 +61,29 @@ void worker(void *) {
         vTaskDelete(nullptr);
         return;
     }
+    BLEDevice::setMTU(517); // Phone still negotiates the actual ATT MTU.
     BLEServer *server = BLEDevice::createServer();
     server->setCallbacks(&callbacks);
-    // Eight characteristics, each with value, declaration, CCCD and description.
     BLEService *service = server->createService(BLEUUID(SERVICE_UUID), 48);
-    const char *names[VALUE_COUNT] = {
-        "LMS HR (bpm)", "LMS median IBI (ms)", "RMSSD (ms)",
-        "Session baseline (ms)", "Live short reference (ms)",
-        "7-session baseline (ms)",
-        "Finger,motion,converged,stable,fresh,saved,episode",
-        "Uptime(s),max loop gap(us)"
-    };
     for (unsigned i = 0; i < VALUE_COUNT; ++i) {
         char uuid[37];
-        snprintf(uuid, sizeof(uuid), "7d2a%04x-8f5a-4b10-9b6d-6f7574726100", VALUE_IDS[i]);
-        values[i] = service->createCharacteristic(uuid,
-            BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-        values[i]->addDescriptor(new BLE2902());
+        snprintf(uuid, sizeof(uuid), "7d2a%04x-8f5a-4b10-9b6d-6f7574726100", 0x101 + i);
+        // Full lines stay readable even when stream notifications are fragmented.
+        values[i] = service->createCharacteristic(uuid, BLECharacteristic::PROPERTY_READ);
         auto *description = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
         description->setAccessPermissions(ESP_GATT_PERM_READ);
-        description->setValue(names[i]);
+        description->setValue(groupName(static_cast<Group>(i)));
         values[i]->addDescriptor(description);
         values[i]->setValue("--");
     }
+    stream = service->createCharacteristic("7d2a01ff-8f5a-4b10-9b6d-6f7574726100",
+                                           BLECharacteristic::PROPERTY_NOTIFY);
+    subscription = new BLE2902();
+    stream->addDescriptor(subscription);
+    auto *description = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
+    description->setAccessPermissions(ESP_GATT_PERM_READ);
+    description->setValue("All groups - newline text stream");
+    stream->addDescriptor(description);
     service->start();
     BLEAdvertising *advertising = BLEDevice::getAdvertising();
     advertising->addServiceUUID(SERVICE_UUID);
@@ -90,20 +99,16 @@ void worker(void *) {
         Snapshot snapshot;
         if (xQueueReceive(snapshots, &snapshot, pdMS_TO_TICKS(250)) != pdTRUE)
             continue;
-        number(0, snapshot.hr);
-        number(1, snapshot.ibi);
-        number(2, snapshot.rmssd);
-        number(3, snapshot.session);
-        number(4, snapshot.shortReference);
-        number(5, snapshot.personal);
-        char text[21]; // every notification fits the default 23-byte ATT MTU
-        snprintf(text, sizeof(text), "%u,%u,%u,%u,%u,%u,%u",
-            snapshot.finger, snapshot.motion, snapshot.converged, snapshot.stable,
-            snapshot.fresh, snapshot.savedSessions, snapshot.episode);
-        send(6, text);
-        snprintf(text, sizeof(text), "%lu,%lu", (unsigned long)snapshot.uptimeSeconds,
-            (unsigned long)snapshot.maxLoopGapUs);
-        send(7, text);
+        char line[LINE_CAPACITY];
+        for (unsigned i = 0; i < VALUE_COUNT; ++i) {
+            if (formatLine(static_cast<Group>(i), snapshot, line, sizeof(line)))
+                values[i]->setValue(std::string(line));
+        }
+        for (unsigned i = 0; i < VALUE_COUNT; ++i) {
+            if (!connected.load() || !subscription->getNotifications()) break;
+            if (formatLine(static_cast<Group>(i), snapshot, line, sizeof(line))) sendLine(line);
+        }
+        sendLine("\n");
     }
 }
 } // namespace

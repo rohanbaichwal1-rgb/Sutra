@@ -105,23 +105,29 @@ with less than 10% drop against every available reference, at least one referenc
 available, and no active intervention. Exactly 10% does not qualify. The short
 reference continues adapting during recovery when quality permits.
 
-## Serial output
+## Serial and BLE output
 
-- `SessionBaseline:<value>ms (FROZEN)` after completion; `--` while collecting.
-- `SessionValid:50/100s | Samples:10/20` shows this startup's progress.
-- `State:COLLECTING`, `PAUSED:<reason>` or `FROZEN`; `Storage:SAVED` confirms saving.
-- `SavedSessions:0/7` through `7/7` and `Long-term:<value>ms` once established.
-- `SessionDevPct`, `ShortDevPct`, and `DevPct` compare against session, live short,
-  and seven-session personal values, respectively.
-- Short status is `ADAPTING`, `COLLECTING`, or `PAUSED`; `ShortGate` shows the
-  blocker. `ShortBlock` and `ShortBreaks` show block progress and interruptions,
-  including interruptions that clear between reports.
-- `P1[Session/Short/7Session]` and `P2[Session/Short/7Session]` show independent timers.
-  `PostExercise` shows remaining LOW time, with `PAUSED` on MODERATE.
-- The idle `State:MONITORING` field is omitted. After a trigger, `Episode:P1/P2`
-  and `Rearm:0/60s` appear until recovery completes. Rearming needs 60 seconds of
-  stable, qualified data below 10% drop against all available references, with
-  no active haptics. This is separate from post-exercise recovery.
+Serial and BLE use separate lines for Normal, LMS, PDR, P1, P2, SessionBaseline,
+Short, PersonalBaseline and System. Each line includes device uptime.
+
+- `SessionBaseline | RMSSD:<value>ms` with `State:FROZEN` after completion;
+  `RMSSD:--` while collecting. `Valid:50/100s | Samples:10/20` shows this startup's
+  progress. `State:PAUSED:<reason>` explains pauses; `Storage:SAVED` confirms saving.
+- `PersonalBaseline` shows `SavedSessions:0/7` through `7/7` and the stored median
+  once established.
+- `Dev` on each reference's line compares current fresh RMSSD with that reference.
+  Positive values mean a drop; unavailable/stale inputs display `--`.
+- `Short` shows `State:ADAPTING`, `COLLECTING`, or `PAUSED`. `Gate` explains the
+  blocker. `Valid` is qualifying time still in the rolling window; `Block` and
+  `Breaks` show block progress and interruptions, including brief interruptions.
+- `P1` and `P2` each show independent `Session`, `Short`, and `7Session` hold
+  timers, followed by `Triggered` and `Source`. Unavailable reference paths show `--`.
+- `System` includes `PostExercise` with remaining LOW time and `PAUSED` on MODERATE.
+  `Rearm:0/60s` appears only after a trigger until recovery completes. Rearming
+  needs 60 seconds of stable, qualified data below 10% drop against all available
+  references, with no active haptics. This is separate from post-exercise recovery.
+
+BLE group UUIDs and notification setup: [ble-telemetry.md](ble-telemetry.md).
 
 ## LMS convergence and RMSSD stability
 
