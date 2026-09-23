@@ -249,9 +249,28 @@ void test_session_freezes_and_saves_its_own_median_while_short_adapts()
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 70, store.records[0].values[0]);
 }
 
+void test_short_trend_adapts_without_collecting_unstable_session_baseline()
+{
+    Collector session;
+    rmssd::Monitor monitor;
+    rmssd::Input in = {0, 100, true, rmssd::Motion::LOW_MOTION, false, false, false, 0};
+    for (uint32_t t = 0; t <= 120000; t += 1000)
+    {
+        in.now = t;
+        in.current = 100 + t / 10000.0f;
+        monitor.update(in);
+        session.update(t, in.current, monitor.restingGate() == rmssd::CollectionGate::OPEN);
+    }
+    TEST_ASSERT_TRUE(monitor.shortAvailable());
+    TEST_ASSERT_EQUAL_UINT(24, monitor.sampleCount());
+    TEST_ASSERT_FALSE(session.complete());
+    TEST_ASSERT_EQUAL_UINT(0, session.sampleCount());
+}
+
 int main()
 {
     UNITY_BEGIN();
+    RUN_TEST(test_short_trend_adapts_without_collecting_unstable_session_baseline);
     RUN_TEST(test_session_requires_100_seconds_and_uses_median);
     RUN_TEST(test_session_pauses_without_expiring_completed_blocks);
     RUN_TEST(test_session_timer_survives_rollover_and_power_loss_discards_incomplete_session);

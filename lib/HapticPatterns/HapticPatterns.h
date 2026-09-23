@@ -7,13 +7,13 @@ namespace haptics
 constexpr unsigned MOTOR_COUNT = 3;
 constexpr uint32_t BREATH_CYCLE_MS = 10000UL;
 constexpr uint32_t DEFAULT_P1_DURATION_MS = 5000UL;
-constexpr uint16_t DEFAULT_P2_CYCLES = 6;
+constexpr uint16_t DEFAULT_P2_CYCLES = 1; // One 10-second cycle for testing.
 constexpr uint32_t MIN_BURST_MS = 60UL;
 constexpr uint32_t MAX_BURST_MS = 250UL;
 constexpr uint32_t MIN_GAP_MS = 50UL;
 constexpr uint32_t MAX_GAP_MS = 450UL;
 
-enum class Protocol : uint8_t { IDLE, P1_FLUTTER, P2_SWEEP };
+enum class Protocol : uint8_t { IDLE, P1_FLUTTER, P2_SWEEP, BOOT_TEST };
 
 // Logical order: Motor 1 left, Motor 2 center/P6, Motor 3 right.
 // Levels are thousandths of the configured driver amplitude (0..1000).
@@ -27,6 +27,7 @@ struct Frame
 class Patterns
 {
 public:
+    bool startBootTest(uint32_t now);
     bool startP1(uint32_t now, uint32_t seed,
                  uint32_t durationMs = DEFAULT_P1_DURATION_MS);
     bool startP2(uint32_t now, uint16_t cycles = DEFAULT_P2_CYCLES);

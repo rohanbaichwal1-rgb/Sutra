@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <PdrObserver.h>
 #include <RmssdReferences.h>
+#include <HapticPlayback.h>
 
 namespace telemetry {
 enum class Group : uint8_t { NORMAL, LMS, PDR, P1, P2, SESSION, SHORT, PERSONAL, SYSTEM, COUNT };
@@ -14,6 +15,15 @@ struct Snapshot {
     pdr::Result respiration;
     float normalHr = 0, normalIbi = 0;
     bool imuOK = false, p1Triggered = false, p2Triggered = false;
+    bool hapticFault = false;
+    haptics::Playback p1Playback = haptics::Playback::NOT_STARTED;
+    haptics::Playback p2Playback = haptics::Playback::NOT_STARTED;
+    haptics::Playback bootPlayback = haptics::Playback::NOT_STARTED;
+    uint8_t motorFaultBits = 0;
+    uint32_t hrAgeMs = UINT32_MAX, rmssdAgeMs = UINT32_MAX;
+    uint32_t rmssdAccepted = 0, rmssdRejectJump = 0, rmssdRejectRange = 0;
+    uint32_t hrRejected = 0, shapeRejected = 0, lastRmssdInput = 0, lastRmssdRejected = 0;
+    char freshnessReason[24] = {};
     uint32_t p1Ms[3] = {}, p2Ms[3] = {}; // Session / Short / seven-session
     rmssd::Source p1Source = rmssd::Source::NONE, p2Source = rmssd::Source::NONE;
     uint32_t sessionValidMs = 0, sessionTargetMs = 0;

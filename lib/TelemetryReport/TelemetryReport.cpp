@@ -34,6 +34,22 @@ float deviation(float value, float reference) {
         rmssd::Monitor::deviation(value,reference) : NAN;
 }
 const char *yn(bool value) { return value ? "Y" : "N"; }
+void age(Line &line, uint32_t milliseconds) {
+    if (milliseconds == UINT32_MAX) line.append("--");
+    else line.append("%lums", static_cast<unsigned long>(milliseconds));
+}
+const char *protocolAction(const Snapshot &s, bool p1) {
+    const auto playback = p1 ? s.p1Playback : s.p2Playback;
+    if (s.hapticFault) return "MOTOR_FAULT";
+    if (playback == haptics::Playback::STARTED) return "PLAYING";
+    if (p1 ? s.p1Triggered : s.p2Triggered) return "WAIT_RECOVERY";
+    if (p1 && s.p2Playback == haptics::Playback::STARTED) return "P2_PRIORITY";
+    if (!isfinite(s.session) && !isfinite(s.shortReference) && !isfinite(s.personal)) return "NO_REFERENCE";
+    if (!s.fresh || !s.imuOK) return "INVALID_INPUT";
+    if (s.motion != 0) return "MOTION_PAUSED";
+    if (s.postExercise) return "POST_EXERCISE";
+    return "MONITORING";
+}
 void hold(Line &line, uint32_t elapsed, float reference, uint32_t required) {
     if (isfinite(reference)) line.append("%lu/%lus",(unsigned long)(elapsed/1000),(unsigned long)(required/1000));
     else line.append("--");
@@ -67,6 +83,14 @@ bool formatLine(Group group, const Snapshot &s, char *output, size_t capacity) {
         line.append(" | IBI:"); line.value(s.ibi,"ms",0);
         line.append(" | RMSSD:"); line.value(s.rmssd,"ms");
         line.append(" | Converged:%s | RMSSDstable:%s | Fresh:%s",yn(s.converged),yn(s.stable),yn(s.fresh));
+        line.append(" | Input:%s | HRage:",s.freshnessReason);
+        age(line,s.hrAgeMs);
+        line.append(" | RMSSDage:"); age(line,s.rmssdAgeMs);
+        line.append(" | RRok:%lu | RRjumpReject:%lu | RRrangeReject:%lu | HRreject:%lu | ShapeReject:%lu | LastRR:%lums | LastRejectRR:%lums",
+            (unsigned long)s.rmssdAccepted,(unsigned long)s.rmssdRejectJump,
+            (unsigned long)s.rmssdRejectRange,(unsigned long)s.hrRejected,
+            (unsigned long)s.shapeRejected,(unsigned long)s.lastRmssdInput,
+            (unsigned long)s.lastRmssdRejected);
         break;
     case Group::PDR: {
         const auto &p = s.respiration;
@@ -89,6 +113,8 @@ bool formatLine(Group group, const Snapshot &s, char *output, size_t capacity) {
         line.append(" | 7Session:"); hold(line,timers[2],s.personal,required);
         line.append(" | Triggered:%s | Source:%s",yn(p1 ? s.p1Triggered : s.p2Triggered),
             rmssd::sourceName(p1 ? s.p1Source : s.p2Source));
+        line.append(" | Playback:%s | Action:%s",
+            haptics::playbackName(p1 ? s.p1Playback : s.p2Playback),protocolAction(s,p1));
         if (!p1) line.append(" | RateMatch:%s",pdr::syncName(s.respiration.sync));
         break;
     }
@@ -120,6 +146,7 @@ bool formatLine(Group group, const Snapshot &s, char *output, size_t capacity) {
         if (s.episode) line.append(" | Rearm:%lu/60s",(unsigned long)(s.rearmMs/1000));
         line.append(" | Haptic:%s",s.hapticState);
         if (s.hapticDurationMs) line.append(" %lu/%lus",(unsigned long)(s.hapticElapsedMs/1000),(unsigned long)(s.hapticDurationMs/1000));
+        line.append(" | BootTest:%s | FaultBits:0x%02X",haptics::playbackName(s.bootPlayback),(unsigned)s.motorFaultBits);
         break;
     default: break;
     }

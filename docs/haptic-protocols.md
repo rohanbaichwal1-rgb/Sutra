@@ -1,9 +1,24 @@
 # Three-motor haptic actuation
 
 The PoC uses the existing RMSSD P1/P2 events. It does not invent a State Alpha
-classifier or confidence score. P1 runs for five seconds; P2 runs for six complete
-ten-second breathing cycles (60 seconds). P2 replaces an active P1; a P1 request
+classifier or confidence score. P1 runs for five seconds; P2 runs for one complete
+ten-second breathing cycle for testing. P2 replaces an active P1; a P1 request
 cannot interrupt P2.
+
+The RMSSD drop thresholds remain 5% for P1 and 10% for P2, with trigger holds
+of 30 seconds and 120 seconds respectively. These playback durations include
+the existing pattern's quiet intervals. With only Motor 1 connected, P2 drives
+it during 0–1.3 seconds and 6–10 seconds; the other phases are silent.
+
+The current single-motor firmware sets `ArrayConfig::outputScalePercent = 40`.
+It scales the original 0–100% envelope into 0–40%, preserving ramps and pauses
+instead of forcing a fixed ON intensity. P1's original 90% taps become 36%;
+P2's 10–50% ramps become 4–20%, its 60% hold becomes 24%, and its 30–0%
+exhale becomes 12–0%. The original envelopes are described below.
+Percentages are converted to raw 0–127 DRO codes with rounding: a 40% full-scale
+command is code 51, not the reference sketch's raw code 40. Phase timing, fault
+handling and motor electrical settings are unchanged. The library default of
+100 preserves the original envelope; 0 mutes it.
 
 ## Hardware mapping
 
@@ -65,6 +80,25 @@ the intended spatial cue; individual LRAs are not commanded to move physically
 toward or away from P6.
 
 ## Runtime status and faults
+
+Every boot runs a separate five-second continuous `BOOT_TEST` on Motor 1 / CH0
+after haptic initialization and before sensor initialization. It uses the 40%
+output limit (raw DRO code 51), polls faults every 100 ms, and stops on failure.
+No sensor samples or P1/P2 threshold events are generated during this check.
+It does not retry a latched fault. `BootTest` remains in the System report so
+the result is visible even if the serial monitor connects after startup.
+Completion confirms the command sequence and acknowledged shutdown, not measured
+physical vibration; confirm the motor response by touch. A 0x02 fault is labelled
+`UNDERVOLTAGE`; the module supply/wiring must be checked under motor-start load.
+
+P1/P2 reports separate threshold `Triggered` from last-attempt `Playback`:
+`NOT_STARTED`, `STARTED`, `COMPLETED`, `FAILED`, `PREEMPTED`, or `SUPPRESSED`.
+`Action` explains `PLAYING`, `WAIT_RECOVERY`, `MOTOR_FAULT`, `P2_PRIORITY`,
+`NO_REFERENCE`, `INVALID_INPUT`, `MOTION_PAUSED`, `POST_EXERCISE`, or `MONITORING`.
+Timers can still exceed their hold duration after the episode fires; this is
+not another motor command. Playback failure does not clear threshold latches or
+bypass the existing recovery requirement. A P2 start can preempt active P1;
+simultaneous threshold events give P2 priority. Negative deviation is unchanged.
 
 The compact report shows `Haptic:OFF`, `P1_FLUTTER`, or `P2_SWEEP`, plus elapsed
 and total intervention seconds. Protocol starts/completion and hardware errors

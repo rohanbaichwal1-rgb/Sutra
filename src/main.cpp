@@ -39,7 +39,9 @@
 #include "DigitalFilter.h"
 #include <7Semi_BMI270.h>
 #include <RmssdReferences.h>
+#include <BeatRecovery.h>
 #include <HapticPatterns.h>
+#include <HapticPlayback.h>
 #include "HapticWireBus.h"
 #include "NvsBaselineStore.h"
 #include "BleTelemetry.h"
@@ -318,6 +320,10 @@ float lmsRunningPeakAmplitude = 0.0f;
 bool lmsHaveRunningPeakAmplitude = false;
 
 uint32_t lastCleanedBeatMs = 0;
+beats::Recovery lmsRecovery;
+// Since-boot diagnostics; do not erase evidence during rhythm/contact resets.
+uint32_t hrRejectedCount = 0, shapeRejectedCount = 0;
+static_assert(STALE_RESEED_MS == beats::Recovery::STALE_MS, "Keep freshness timeouts aligned");
 
 // Local-peak history used by the Elgendi detector.
 bool g_haveZHistory = false;
@@ -552,6 +558,7 @@ void resetElgendiState()
     lmsHaveRunningPeakAmplitude = false;
 
     lastCleanedBeatMs = 0;
+    lmsRecovery.reset();
 
     latestCleanedIBI = 0;
     newCleanedIBIAvailable = false;
@@ -716,10 +723,34 @@ void detectBeatOnCleanedSignal(float cleanedValue)
             absoluteAmplitudeOK &&
             relativeAmplitudeOK)
         {
+            if (lmsRecovery.observe(peakMs))
+            {
+                // Replace a stale rhythm only after four consistent observed
+                // candidate intervals. Keep the existing displayed-HR smoothing.
+                lmsIbiHistoryCount = lmsIbiHistoryHead = 0;
+                for (unsigned i = 0; i < beats::Recovery::REQUIRED; ++i)
+                    rememberLmsIbi(lmsRecovery.interval(i));
+                lmsRecovery.clearCandidates();
+                lastCleanedBeatMs = peakMs;
+                latestCleanedIBI = 0;
+                newCleanedIBIAvailable = false;
+                // Do not join HRV intervals across an uncertain rhythm segment.
+                resetRmssdSessionState();
+                resetRmssdStabilityState();
+                referenceMonitor.interruptContinuity();
+                sessionCollector.interrupt();
+                pdrService::contactChanged(peakMs);
+                lmsRunningPeakAmplitude = peakAmplitude;
+                lmsHaveRunningPeakAmplitude = true;
+                Serial.println("[LMS] rhythm reacquired; waiting for accepted beat");
+                return; // Still stale until the next genuinely accepted beat.
+            }
+            bool acceptedPeak = false;
             if (lastCleanedBeatMs == 0)
             {
                 // First valid crest only seeds timing.
                 lastCleanedBeatMs = peakMs;
+                acceptedPeak = true;
             }
             else
             {
@@ -750,6 +781,7 @@ void detectBeatOnCleanedSignal(float cleanedValue)
                         {
                             lastCleanedBeatMs = peakMs;
                             rememberLmsIbi(rhythmIbi);
+                            acceptedPeak = !reconstructed;
 
                             // Do NOT send acquisition/reconstructed timing to
                             // RMSSD. HRV starts only after rhythm lock.
@@ -760,12 +792,15 @@ void detectBeatOnCleanedSignal(float cleanedValue)
                                 lmsHR_smoothed = 60000.0f / medIbi;
                                 lmsBeatCount = LMS_ACQUISITION_IBIS;
                                 newCleanedIBIAvailable = true;
+                                if (!reconstructed) lmsRecovery.accept(peakMs);
+                                else lmsRecovery.seedRhythm(peakMs);
                             }
                         }
                         else
                         {
                             // Bad startup interval. Re-seed timing at this crest
                             // without poisoning rhythm history.
+                            ++hrRejectedCount;
                             lastCleanedBeatMs = peakMs;
                         }
                     }
@@ -784,6 +819,9 @@ void detectBeatOnCleanedSignal(float cleanedValue)
                                     latestCleanedIBI,
                                     peakMs))
                                 pdrService::beat(peakMs, peakAmplitude, latestCleanedIBI);
+
+                            lmsRecovery.accept(peakMs);
+                            acceptedPeak = true;
 
                             rememberLmsIbi(sinceLast);
 
@@ -808,6 +846,7 @@ void detectBeatOnCleanedSignal(float cleanedValue)
                         else
                         {
                             float medIbi = medianRecentLmsIbi();
+                            ++hrRejectedCount;
 
                             // Short reject: likely dicrotic/notch; keep timing
                             // from the last accepted pulse. Long reject: likely
@@ -822,10 +861,13 @@ void detectBeatOnCleanedSignal(float cleanedValue)
                 }
                 else if (sinceLast > 1800UL)
                 {
+                    ++hrRejectedCount;
                     // Lost synchronization. Re-seed at this crest, but
                     // do not feed the long interval into RMSSD.
                     lastCleanedBeatMs = peakMs;
                 }
+                else
+                    ++hrRejectedCount; // Below the physiological/refractory limit.
             }
 
             // Track amplitude only from a valid seed or a robustly accepted
@@ -833,7 +875,7 @@ void detectBeatOnCleanedSignal(float cleanedValue)
             // amplitude floor used by later pulses.
             bool amplitudeSeedOrAccepted =
                 (!lmsHaveRunningPeakAmplitude) ||
-                (lastCleanedBeatMs == peakMs);
+                acceptedPeak;
 
             if (amplitudeSeedOrAccepted)
             {
@@ -851,6 +893,8 @@ void detectBeatOnCleanedSignal(float cleanedValue)
                 }
             }
         }
+        else
+            ++shapeRejectedCount;
     }
 
     dbgLastBlockLen = 0;
@@ -862,7 +906,7 @@ void detectBeatOnCleanedSignal(float cleanedValue)
 
 bool isLmsHRValid()
 {
-    return fingerPresent && lmsBeatCount >= LMS_ACQUISITION_IBIS && lmsIbiHistoryCount >= LMS_ACQUISITION_IBIS && lastCleanedBeatMs != 0 && ((millis() - lastCleanedBeatMs) < STALE_RESEED_MS) && lmsHR_smoothed >= HR_MIN_PLAUSIBLE_BPM && lmsHR_smoothed <= HR_MAX_PLAUSIBLE_BPM;
+    return fingerPresent && lmsBeatCount >= LMS_ACQUISITION_IBIS && lmsIbiHistoryCount >= LMS_ACQUISITION_IBIS && lmsRecovery.fresh(millis()) && lmsHR_smoothed >= HR_MIN_PLAUSIBLE_BPM && lmsHR_smoothed <= HR_MAX_PLAUSIBLE_BPM;
 }
 
 // ============================================================
@@ -930,6 +974,8 @@ const uint8_t RMSSD_ARTIFACT_SEED_BEATS = 3; // don't gate the first few beats o
 
 uint32_t g_lastAcceptedRmssdIbiMs = 0;
 uint16_t g_rmssdAcceptedBeatCount = 0;
+uint32_t rmssdAcceptedTotal = 0, rmssdRejectJumpTotal = 0, rmssdRejectRangeTotal = 0;
+uint32_t lastRmssdInputMs = 0, lastRmssdRejectedMs = 0;
 
 bool isIbiPlausibleForRmssd(uint32_t ibiMs)
 {
@@ -956,8 +1002,15 @@ bool isIbiPlausibleForRmssd(uint32_t ibiMs)
 // the rejected one.
 bool addIbiToRmssdBuffer(uint32_t ibiMs, uint32_t nowMs)
 {
+    lastRmssdInputMs = ibiMs;
     if (!isIbiPlausibleForRmssd(ibiMs))
+    {
+        lastRmssdRejectedMs = ibiMs;
+        if (ibiMs < MIN_IBI_MS || ibiMs > MAX_IBI_MS) ++rmssdRejectRangeTotal;
+        else ++rmssdRejectJumpTotal;
         return false;
+    }
+    ++rmssdAcceptedTotal;
 
     rmssdBuf[rmssdHead].ibiMs = ibiMs;
     rmssdBuf[rmssdHead].tMs = nowMs;
@@ -1735,9 +1788,9 @@ void updateBaseline(uint32_t nowMs)
 // LONG_TERM is enabled only after seven completed sessions are saved in NVS.
 // See lib/RmssdReferences for rolling median and recovery rules.
 //
-// SmartElex DA7280 modules with their onboard LRAs:
-// TCA9548A 0x70, channels 0/1/2 = left/center(P6)/right; each DA7280 = 0x4A.
-// The original single GPIO actuator is replaced by I2C DRO amplitude control.
+// Prototype wiring: one SmartElex DA7280 module with its onboard LRA on
+// TCA9548A channel 0. The driver still supports three modules by increasing
+// motorCount and wiring channels 1/2 when the hardware is added.
 // ============================================================
 
 const uint32_t HAPTIC_FRAME_INTERVAL_MS = 10UL;
@@ -1745,9 +1798,18 @@ const uint32_t HAPTIC_FAULT_POLL_MS = 100UL;
 const uint32_t HAPTIC_STOP_RETRY_MS = 250UL;
 
 HapticWireBus hapticBus(Wire);
-haptics::ArrayConfig hapticArrayConfig;
+haptics::ArrayConfig singleMotorHapticConfig()
+{
+    haptics::ArrayConfig config;
+    config.motorCount = 1;
+    config.channels[0] = 0;
+    config.outputScalePercent = 40; // Map the original 0..100% envelope to 0..40%.
+    return config;
+}
+haptics::ArrayConfig hapticArrayConfig = singleMotorHapticConfig();
 haptics::Array hapticArray(hapticBus, hapticArrayConfig);
 haptics::Patterns hapticPatterns;
+haptics::PlaybackLog hapticPlayback;
 bool hapticPatternActive = false;
 bool hapticFaultReported = false;
 uint8_t reportedHapticWarnings = 0;
@@ -1763,6 +1825,8 @@ const char *getHapticStateName()
         return "P1_FLUTTER";
     if (hapticPatterns.protocol() == haptics::Protocol::P2_SWEEP)
         return "P2_SWEEP";
+    if (hapticPatterns.protocol() == haptics::Protocol::BOOT_TEST)
+        return "BOOT_TEST";
     return "OFF";
 }
 
@@ -1800,6 +1864,8 @@ void reportHapticFault()
     Serial.print(hapticArray.errorMotor());
     Serial.print(" | FaultBits:0x");
     Serial.println(hapticArray.faultBits(), HEX);
+    if (hapticArray.error() == haptics::ArrayError::DRIVER_FAULT && (hapticArray.faultBits() & 0x02))
+        Serial.println("[HAPTIC] UNDERVOLTAGE: check module supply during motor start; no automatic restart");
 }
 
 void updateHapticActuator(uint32_t nowMs)
@@ -1807,6 +1873,7 @@ void updateHapticActuator(uint32_t nowMs)
     const bool wasP2 = hapticPatterns.protocol() == haptics::Protocol::P2_SWEEP;
     if (!hapticArray.ready())
     {
+        hapticPlayback.finished(false);
         if (wasP2)
             pdrService::endP2(nowMs, false);
         hapticPatterns.stop();
@@ -1829,8 +1896,11 @@ void updateHapticActuator(uint32_t nowMs)
     const bool naturallyCompleted = !hapticPatterns.active();
     if (!hapticPatterns.active())
     {
-        if (hapticArray.stopAll())
-            Serial.println("[HAPTIC] protocol complete");
+        // Check final status before declaring the command sequence complete.
+        const bool completed = hapticArray.pollFaults() && hapticArray.stopAll();
+        hapticPlayback.finished(completed);
+        Serial.println(completed ? "[HAPTIC] Playback:COMPLETED (command sequence; physical vibration unverified)"
+                                 : "[HAPTIC] Playback:FAILED");
     }
     else if (!hapticArray.apply(frame))
         hapticPatterns.stop();
@@ -1842,6 +1912,7 @@ void updateHapticActuator(uint32_t nowMs)
             hapticPatterns.stop();
     }
     hapticPatternActive = hapticPatterns.active() || hapticArray.outputStopPending();
+    if (!hapticArray.ready()) hapticPlayback.finished(false);
     if (wasP2 && !hapticPatterns.active())
         pdrService::endP2(nowMs, naturallyCompleted && hapticArray.ready() && !hapticArray.outputStopPending());
     reportHapticFault();
@@ -1851,15 +1922,20 @@ void startHapticProtocol(haptics::Protocol protocol, uint32_t nowMs)
 {
     if (!hapticArray.ready())
     {
+        hapticPlayback.failedRequest(protocol);
         Serial.println("[HAPTIC] trigger received; driver array unavailable");
         return;
     }
     if (protocol == haptics::Protocol::P1_FLUTTER &&
         hapticPatterns.protocol() == haptics::Protocol::P2_SWEEP)
+    {
+        hapticPlayback.suppressed(protocol);
         return; // P2 retains priority
+    }
 
     if (!hapticArray.pollFaults() || !hapticArray.stopAll())
     {
+        hapticPlayback.failedRequest(protocol);
         if (hapticPatterns.protocol() == haptics::Protocol::P2_SWEEP)
             pdrService::endP2(nowMs, false);
         hapticPatterns.stop();
@@ -1869,15 +1945,18 @@ void startHapticProtocol(haptics::Protocol protocol, uint32_t nowMs)
     }
     // Fresh hardware seed for each flutter. P2 replaces P1 immediately.
     nowMs = millis(); // Start the envelope after the preparation transfers.
-    bool started = protocol == haptics::Protocol::P2_SWEEP
+    bool started = protocol == haptics::Protocol::BOOT_TEST
+                       ? hapticPatterns.startBootTest(nowMs)
+                       : protocol == haptics::Protocol::P2_SWEEP
                        ? hapticPatterns.startP2(nowMs)
                        : hapticPatterns.startP1(nowMs, esp_random());
-    if (started && !hapticArray.apply(hapticPatterns.frame()))
+    if (!started || !hapticArray.apply(hapticPatterns.frame()))
         hapticPatterns.stop();
     lastHapticFrameMs = lastHapticFaultPollMs = nowMs;
     hapticPatternActive = hapticPatterns.active() || hapticArray.outputStopPending();
     if (hapticPatterns.active())
     {
+        hapticPlayback.started(protocol);
         if (protocol == haptics::Protocol::P2_SWEEP)
             pdrService::beginP2(nowMs);
         Serial.print("[HAPTIC] started ");
@@ -1886,7 +1965,24 @@ void startHapticProtocol(haptics::Protocol protocol, uint32_t nowMs)
         Serial.print(hapticPatterns.durationMs() / 1000UL);
         Serial.println("s");
     }
+    else
+        hapticPlayback.failedRequest(protocol);
     reportHapticFault();
+}
+
+void runStartupMotorCheck()
+{
+    Serial.println("[HAPTIC] BOOT_TEST: continuous motor 1 check for 5s at 40%; confirm vibration by touch");
+    startHapticProtocol(haptics::Protocol::BOOT_TEST, millis());
+    // Before sensors start: no measurement/baseline data is collected during
+    // this bounded startup-only wait. Keep fault polling and stop servicing live.
+    while (hapticPatterns.active())
+    {
+        updateHapticActuator(millis());
+        delay(1);
+    }
+    Serial.print("[HAPTIC] BOOT_TEST Playback:");
+    Serial.println(haptics::playbackName(hapticPlayback.state(haptics::Protocol::BOOT_TEST)));
 }
 
 // RMSSD can remain mathematically valid while its last accepted beat is old.
@@ -1897,6 +1993,18 @@ bool isReferenceInputFresh(uint32_t nowMs)
         return false;
     int newest = (rmssdHead + RMSSD_BUFFER_SIZE - 1) % RMSSD_BUFFER_SIZE;
     return nowMs - rmssdBuf[newest].tMs < STALE_RESEED_MS;
+}
+
+const char *referenceFreshnessReason(uint32_t nowMs)
+{
+    if (!fingerPresent) return "NO_CONTACT";
+    if (!latestAccelOK || !latestGyroOK) return "IMU_INVALID";
+    if (lmsIbiHistoryCount < LMS_ACQUISITION_IBIS) return "HR_ACQUIRING";
+    if (!isLmsHRValid()) return "HR_STALE_OR_INVALID";
+    if (!rmssdValid || rmssdCount == 0) return "RMSSD_WARMUP";
+    int newest = (rmssdHead + RMSSD_BUFFER_SIZE - 1) % RMSSD_BUFFER_SIZE;
+    if (nowMs - rmssdBuf[newest].tMs >= STALE_RESEED_MS) return "RMSSD_STALE";
+    return "OK";
 }
 
 void updateStressTriggers(uint32_t nowMs)
@@ -1927,6 +2035,8 @@ void updateStressTriggers(uint32_t nowMs)
     }
     if (events.p2 != rmssd::Source::NONE)
     {
+        if (events.p1 != rmssd::Source::NONE)
+            hapticPlayback.suppressed(haptics::Protocol::P1_FLUTTER);
         Serial.print("[P2] TRIGGERED | TriggerSource:");
         Serial.print(rmssd::sourceName(events.p2));
         Serial.print(" | LongTermBasis:SEVEN_SESSIONS | PDR_SUPPORT:");
@@ -1954,7 +2064,11 @@ void processSample(uint32_t green, uint32_t nowMs);
         Serial.print("[STARTUP ERROR] ");
         Serial.print(message);
         Serial.println(" | Check power/SDA/SCL and press RESET.");
-        delay(2000);
+        for (unsigned i = 0; i < 200; ++i)
+        {
+            updateHapticActuator(millis()); // Retry any uncertain boot-test stop.
+            delay(10);
+        }
     }
 }
 
@@ -2001,10 +2115,12 @@ void setup()
     // Sensor initialization continues if the haptic array is absent/faulty.
     Serial.println("[Startup] Checking haptic mux/drivers...");
     if (hapticArray.begin())
-        Serial.println("[HAPTIC] 3 x DA7280 ready | M1:CH0 M2:CH1 M3:CH2 | P1:5s P2:60s");
+        Serial.println("[HAPTIC] 1 x DA7280 ready | M1:CH0 | P1:5s P2:10s | Intensity range:0-40%");
     else
         reportHapticFault();
     hapticPatternActive = hapticArray.outputStopPending();
+
+    runStartupMotorCheck();
 
     // ========================================================
     // MAX30101
@@ -2318,6 +2434,22 @@ void loop()
         snapshot.converged = isLmsConvergedGate();
         snapshot.stable = isRmssdStableGate();
         snapshot.fresh = fresh;
+        snapshot.hrAgeMs = lmsRecovery.acceptedAge(nowMs);
+        if (rmssdCount > 0)
+            snapshot.rmssdAgeMs = nowMs - rmssdBuf[(rmssdHead + RMSSD_BUFFER_SIZE - 1) % RMSSD_BUFFER_SIZE].tMs;
+        snapshot.rmssdAccepted = rmssdAcceptedTotal;
+        snapshot.rmssdRejectJump = rmssdRejectJumpTotal;
+        snapshot.rmssdRejectRange = rmssdRejectRangeTotal;
+        snapshot.hrRejected = hrRejectedCount;
+        snapshot.shapeRejected = shapeRejectedCount;
+        snapshot.lastRmssdInput = lastRmssdInputMs;
+        snapshot.lastRmssdRejected = lastRmssdRejectedMs;
+        snprintf(snapshot.freshnessReason, sizeof(snapshot.freshnessReason), "%s", referenceFreshnessReason(nowMs));
+        snapshot.p1Playback = hapticPlayback.state(haptics::Protocol::P1_FLUTTER);
+        snapshot.p2Playback = hapticPlayback.state(haptics::Protocol::P2_SWEEP);
+        snapshot.bootPlayback = hapticPlayback.state(haptics::Protocol::BOOT_TEST);
+        snapshot.hapticFault = !hapticArray.ready();
+        snapshot.motorFaultBits = hapticArray.faultBits();
         snapshot.savedSessions = personalBaseline.count();
         snapshot.p1Triggered = referenceMonitor.p1Triggered();
         snapshot.p2Triggered = referenceMonitor.p2Triggered();

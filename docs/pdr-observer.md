@@ -65,13 +65,15 @@ Missing PDR is not negative evidence and never blocks P1/P2.
 
 Tracking starts only when the motor protocol successfully starts. The first 30
 seconds are excluded from scoring. After that, the estimator uses only data from
-the current intervention (30–60 seconds), never the preceding resting waveform.
+the current intervention after that exclusion, never the preceding resting waveform.
 At least 20 seconds of observed usable estimates are required. If at least 80%
 of that qualifying time is within 6 +/- 1 breaths/minute, the completed protocol
 reports `RATE_MATCH`; otherwise adequate data reports `NO_RATE_MATCH`.
 Insufficient data, aborted/faulted playback, changed contact or queue loss reports
 `UNKNOWN`. A report gap does not count as observed breathing. The summary remains
 visible until the next P2 starts. Shorter than 30-second segments cannot be scored.
+The current 10-second P2 test playback therefore reports `UNKNOWN`; the observer's
+scoring requirements are unchanged.
 
 This is an exploratory rate match, not verified breathing synchronization or
 proof of the 4-second inhale/6-second exhale ratio. Motor vibration may create

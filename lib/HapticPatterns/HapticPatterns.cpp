@@ -22,6 +22,17 @@ uint32_t Patterns::elapsedMs(uint32_t now) const
     return active() ? now - startedMs_ : 0;
 }
 
+bool Patterns::startBootTest(uint32_t now)
+{
+    if (active()) return false;
+    startedMs_ = now;
+    durationMs_ = 5000UL;
+    protocol_ = Protocol::BOOT_TEST;
+    frame_ = Frame{};
+    frame_.level[0] = 1000; // Array's 40% scaling applies; only motor 1.
+    return true;
+}
+
 bool Patterns::startP1(uint32_t now, uint32_t seed, uint32_t durationMs)
 {
     // A lower-priority P1 request cannot interrupt paced breathing.
@@ -65,7 +76,7 @@ const Frame &Patterns::update(uint32_t now)
         return frame_;
     }
     if (protocol_ == Protocol::P1_FLUTTER) updateFlutter(now, elapsed);
-    else updateSweep(elapsed);
+    else if (protocol_ == Protocol::P2_SWEEP) updateSweep(elapsed);
     return frame_;
 }
 

@@ -61,12 +61,13 @@ using the same frozen session median and preserving previous saved history.
 One reading is stored per complete five-second qualifying block and expires at
 age five minutes. At least 12 retained readings (60 qualifying seconds) are
 needed. Collection continues toward 60 readings. Unlike session collection, short
-collection does not require LMS convergence separately from the fresh-signal and
-RMSSD-stability checks. A positive reference is needed for percentage comparisons.
+collection requires neither LMS convergence nor a flat/stable RMSSD trend.
+Fresh valid LMS-HR/RMSSD and successful IMU reads are still required. A positive
+reference is needed for percentage comparisons.
 
 The short reference adapts through pending triggers and episode recovery whenever
-resting quality gates pass. There is no preliminary 10% freeze or frozen short
-snapshot. Active haptics, invalid/stale data, unstable RMSSD, non-LOW motion and
+signal/motion quality gates pass. There is no preliminary 10% freeze or frozen short
+snapshot. Active haptics, invalid/stale data, non-LOW motion and
 post-exercise recovery pause collection. Readings keep expiring during pauses,
 so `ShortValid` can decrease. Contact changes clear the short buffer but retain
 episode latches, the completed session baseline and saved history.
@@ -88,12 +89,20 @@ blocks and P1/P2 continuous holds.
 
 Each available reference has its own continuous timers:
 
-- P1: current RMSSD at least 20% below that reference for 30 seconds.
-- P2: current RMSSD at least 30% below that reference for 120 seconds.
+- P1: current RMSSD at least 5% below that reference for 30 seconds (current prototype test setting).
+- P2: current RMSSD at least 10% below that reference for 120 seconds (current prototype test setting).
+
+Both timers run together once P2 is crossed; P1 keeps its original start time,
+including after it fires. Returning from P2 into the P1-only range resets P2
+but keeps P1 counting. With qualified data and an available, unchanged reference,
+P1 resets only when RMSSD rises above its 5%-drop boundary. Equality qualifies.
+For a 100 ms reference: 95 ms starts P1; 90 ms starts P2 as well; 92 ms resets
+only P2; above 95 ms resets both. These are independent timers for each reference.
 
 One completed path suffices; elapsed time cannot transfer between paths. Invalid
 input, non-LOW motion or post-exercise recovery breaks holds. RMSSD stability is
-required for adaptation and episode recovery, but not for timing a drop. Each
+required for fixed session collection and episode recovery, but not for short
+adaptation or timing a drop. Each
 level fires once per episode; P2 takes haptic priority.
 
 Sources identify `SESSION`, `SHORT_TERM`, `LONG_TERM`, or explicit combinations
@@ -106,6 +115,29 @@ available, and no active intervention. Exactly 10% does not qualify. The short
 reference continues adapting during recovery when quality permits.
 
 ## Serial and BLE output
+
+The LMS line now includes `Input` (freshness/quality reason), `HRage`, and
+`RMSSDage` in milliseconds (`--` if no accepted beat exists in the current
+history). `Input` distinguishes `NO_CONTACT`, `IMU_INVALID`, `HR_ACQUIRING`,
+`HR_STALE_OR_INVALID`, `RMSSD_WARMUP`, `RMSSD_STALE`, and `OK`.
+`Fresh` retains its original HR/RMSSD freshness meaning; IMU validity is also
+required for baseline/trigger input, so `Input:IMU_INVALID` may coexist with
+`Fresh:Y`. A warmup means insufficient valid RMSSD window data, including after
+rhythm recovery; it does not necessarily mean the device just booted.
+
+Diagnostic counts are cumulative since boot, retained across contact/rhythm
+resets: `RRok` (accepted into RMSSD), `RRjumpReject` (>20% versus the last accepted
+RMSSD interval after seeding), `RRrangeReject` (outside 300–2000 ms), `HRreject`
+(intervals rejected by acquisition, rhythm, or refractory checks), and
+`ShapeReject` (pulse regions failing width/amplitude checks). `LastRR` is the
+last interval offered to RMSSD; `LastRejectRR` is the last rejected there, not
+necessarily the latest candidate. Zero means none has been seen yet.
+These diagnostics do not relax rejection/freshness rules or carry stale values
+into P1/P2 timers. New logs are needed to distinguish the remaining dropout causes.
+
+P1/P2 additionally show playback outcome and next-action status; System retains
+the startup motor-test result and driver fault bits. See
+[haptic-protocols.md](haptic-protocols.md) for these command-status semantics.
 
 Serial and BLE use separate lines for Normal, LMS, PDR, P1, P2, SessionBaseline,
 Short, PersonalBaseline and System. Each line includes device uptime.
@@ -130,6 +162,20 @@ Short, PersonalBaseline and System. Each line includes device uptime.
 BLE group UUIDs and notification setup: [ble-telemetry.md](ble-telemetry.md).
 
 ## LMS convergence and RMSSD stability
+
+HR freshness is measured from an accepted beat, not a rejected crest used to
+reseed timing. After three seconds without accepted beats, LMS HR/IBI displays
+`--`. A stale acquired rhythm can be replaced after four consecutive
+morphology-qualified candidate intervals (300–1800 ms) whose largest interval
+is no more than 15% above the smallest. Accepted beats clear that recovery
+evidence, so isolated notches or missed beats do not replace a fresh rhythm.
+Recovery seeds the seven-interval history with those four observed intervals
+and waits for another accepted beat before publishing HR again. RMSSD and PDR
+beat history restart to avoid mixing the old and new rhythm; pending collection
+blocks/trigger holds are interrupted, but completed reference samples remain.
+The existing HR smoothing factors and step limits are unchanged. This recovery
+heuristic still requires validation on optical waveforms and simultaneous Polar
+recordings; these summary logs cannot establish improved detector accuracy.
 
 LMS convergence checks 20 once-per-second filter-weight observations, smoothed
 with an EMA factor of 0.2. The maximum minus minimum must be at most 20 weight

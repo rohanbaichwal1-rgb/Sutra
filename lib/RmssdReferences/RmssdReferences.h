@@ -15,6 +15,10 @@ constexpr uint32_t POST_EXERCISE_RECOVERY_MS = 60000UL;
 constexpr uint32_t MAX_REPORT_GAP_MS = 2500UL;
 constexpr uint32_t P1_HOLD_MS = 30000UL;
 constexpr uint32_t P2_HOLD_MS = 120000UL;
+// Prototype test thresholds: percentage drop below each available reference.
+constexpr float P1_DROP_PCT = 5.0f;
+constexpr float P2_DROP_PCT = 10.0f;
+static_assert(P2_DROP_PCT > P1_DROP_PCT, "P2 must remain inside the P1 drop range");
 
 enum class Source : uint8_t { NONE = 0, LONG_TERM = 1, SHORT_TERM = 2, BOTH = 3,
                               SESSION = 4, LONG_AND_SESSION = 5, SHORT_AND_SESSION = 6, ALL = 7 };
@@ -43,7 +47,7 @@ struct Input
     float current;
     bool signalGood; // fresh, valid RMSSD and LMS-HR
     Motion motion;
-    bool stable;
+    bool stable; // fixed resting baseline/rearm only, not live short adaptation
     bool interventionActive;
     bool longTermAvailable;
     float longTermBaseline; // persisted seven-session prototype baseline

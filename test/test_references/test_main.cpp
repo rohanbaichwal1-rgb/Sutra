@@ -63,7 +63,9 @@ void test_partial_or_bad_quality_blocks_do_not_count()
     f.input.signalGood = true;
     f.input.stable = false;
     f.seconds(180);
-    TEST_ASSERT_FALSE(f.monitor.shortAvailable());
+    TEST_ASSERT_TRUE(f.monitor.shortAvailable());
+    TEST_ASSERT_EQUAL_STRING("OPEN", collectionGateName(f.monitor.collectionGate()));
+    TEST_ASSERT_EQUAL_STRING("RMSSD_UNSTABLE", collectionGateName(f.monitor.restingGate()));
 }
 
 void test_old_readings_expire_in_wall_time()
@@ -80,16 +82,21 @@ void test_old_readings_expire_in_wall_time()
     TEST_ASSERT_EQUAL_UINT(0, f.monitor.sampleCount());
 }
 
-void test_ten_percent_drop_keeps_short_reference_adapting()
+void test_ten_percent_drop_triggers_p1_at_the_configured_five_percent_threshold()
 {
     Fixture f;
     f.initialize();
     f.input.current = 90;
-    f.seconds(180);
+    f.tick();
+    f.seconds(29);
     TEST_ASSERT_FALSE(f.monitor.p1Triggered());
+    f.tick();
+    TEST_ASSERT_TRUE(f.monitor.p1Triggered());
     TEST_ASSERT_FALSE(f.monitor.p2Triggered());
     TEST_ASSERT_EQUAL_UINT32(300000, f.monitor.validDurationMs());
-    TEST_ASSERT_FLOAT_WITHIN(0.001f, 90, f.monitor.shortReference());
+    // The 5-minute median remains at its former value during this initial
+    // 30-second drop, so the trigger cannot be attributed to a changed reference.
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 100, f.monitor.shortReference());
     TEST_ASSERT_EQUAL_STRING("OPEN", collectionGateName(f.monitor.collectionGate()));
 }
 
@@ -99,7 +106,7 @@ void test_both_paths_trigger_at_30_and_120_seconds()
     f.initialize();
     f.input.longTermAvailable = true;
     f.input.current = 70;
-    f.input.stable = false; // stability is required for adaptation, not triggers
+    f.input.stable = false; // changing RMSSD still permits short adaptation
     f.tick();
     f.seconds(29);
     TEST_ASSERT_FALSE(f.monitor.p1Triggered());
@@ -110,7 +117,8 @@ void test_both_paths_trigger_at_30_and_120_seconds()
     f.seconds(200);
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::NONE), static_cast<int>(f.last.p1));
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::NONE), static_cast<int>(f.last.p2));
-    TEST_ASSERT_FALSE(f.monitor.shortAvailable());
+    TEST_ASSERT_TRUE(f.monitor.shortAvailable());
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 70, f.monitor.shortReference());
 }
 
 void test_short_path_does_not_require_long_term_baseline()
@@ -339,8 +347,9 @@ void test_collection_diagnostics_show_quality_and_motion_recovery()
     TEST_ASSERT_EQUAL_UINT32(3000, f.monitor.sampleBlockMs(f.input.now));
     f.input.stable = false;
     f.tick();
-    TEST_ASSERT_EQUAL_STRING("RMSSD_UNSTABLE", collectionGateName(f.monitor.collectionGate()));
-    TEST_ASSERT_EQUAL_UINT32(1, f.monitor.collectionBreaks());
+    TEST_ASSERT_EQUAL_STRING("OPEN", collectionGateName(f.monitor.collectionGate()));
+    TEST_ASSERT_EQUAL_STRING("RMSSD_UNSTABLE", collectionGateName(f.monitor.restingGate()));
+    TEST_ASSERT_EQUAL_UINT32(0, f.monitor.collectionBreaks());
     f.input.signalGood = false;
     f.tick();
     TEST_ASSERT_EQUAL_STRING("SIGNAL_OR_IMU", collectionGateName(f.monitor.collectionGate()));
@@ -478,14 +487,119 @@ void test_new_personal_baseline_does_not_inherit_old_trigger_time()
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::LONG_TERM), static_cast<int>(f.tick().p1));
 }
 
+void assertAllHolds(const Fixture &f, uint32_t p1, uint32_t p2)
+{
+    TEST_ASSERT_EQUAL_UINT32(p1, f.monitor.p1LongHoldMs(f.input.now));
+    TEST_ASSERT_EQUAL_UINT32(p1, f.monitor.p1SessionHoldMs(f.input.now));
+    TEST_ASSERT_EQUAL_UINT32(p1, f.monitor.p1ShortHoldMs(f.input.now));
+    TEST_ASSERT_EQUAL_UINT32(p2, f.monitor.p2LongHoldMs(f.input.now));
+    TEST_ASSERT_EQUAL_UINT32(p2, f.monitor.p2SessionHoldMs(f.input.now));
+    TEST_ASSERT_EQUAL_UINT32(p2, f.monitor.p2ShortHoldMs(f.input.now));
+}
+
+void test_p1_continues_through_p2_and_resets_only_above_p1_boundary()
+{
+    Fixture f;
+    f.initialize();
+    f.input.longTermAvailable = f.input.sessionAvailable = true;
+    f.input.longTermBaseline = f.input.sessionBaseline = 100;
+    // Keep the short reference fixed to isolate threshold/timer transitions.
+    f.input.interventionActive = true;
+    f.input.current = 95; // exactly 5%: P1 only
+    f.monitor.update(f.input);
+    f.seconds(20);
+    assertAllHolds(f, 20000, 0);
+    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
+
+    f.input.current = 90; // exactly 10%: start P2 without restarting P1
+    f.monitor.update(f.input);
+    assertAllHolds(f, 20000, 0);
+    f.seconds(9);
+    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
+    TEST_ASSERT_EQUAL_INT((int)Source::ALL, (int)f.tick().p1);
+    assertAllHolds(f, 30000, 10000);
+
+    f.seconds(109);
+    TEST_ASSERT_FALSE(f.monitor.p2Triggered());
+    TEST_ASSERT_EQUAL_INT((int)Source::ALL, (int)f.tick().p2);
+    assertAllHolds(f, 140000, 120000);
+
+    f.input.current = 92; // leaving P2 keeps the original P1 timer running
+    f.tick();
+    assertAllHolds(f, 141000, 0);
+    f.input.current = 95;
+    f.tick();
+    assertAllHolds(f, 142000, 0);
+    f.input.current = 95.1f;
+    f.tick();
+    assertAllHolds(f, 0, 0);
+    // Resetting a hold does not bypass the existing episode-recovery latch.
+    TEST_ASSERT_TRUE(f.monitor.p1Triggered());
+    TEST_ASSERT_TRUE(f.monitor.p2Triggered());
+}
+
+void test_p2_restart_does_not_borrow_time_or_reset_p1()
+{
+    Fixture f;
+    f.initialize();
+    f.input.longTermAvailable = f.input.sessionAvailable = true;
+    f.input.longTermBaseline = f.input.sessionBaseline = 100;
+    f.input.interventionActive = true; // isolate timers from short adaptation
+    f.input.current = 90;
+    f.monitor.update(f.input);
+    f.seconds(20);
+    assertAllHolds(f, 20000, 20000);
+    f.input.current = 90.1f; // just above P2, still below P1
+    f.tick();
+    assertAllHolds(f, 21000, 0);
+    f.seconds(9);
+    TEST_ASSERT_EQUAL_INT((int)Source::ALL, (int)f.last.p1);
+    f.input.current = 90;
+    f.tick();
+    assertAllHolds(f, 31000, 0);
+    f.seconds(119);
+    TEST_ASSERT_FALSE(f.monitor.p2Triggered());
+    TEST_ASSERT_EQUAL_INT((int)Source::ALL, (int)f.tick().p2);
+    assertAllHolds(f, 151000, 120000);
+}
+
+void test_short_adapts_to_trends_but_retains_quality_gates()
+{
+    Fixture f;
+    f.input.stable = false;
+    for (unsigned i = 0; i < 360; ++i) {
+        f.input.current = 100 + i * 0.1f;
+        f.tick();
+        TEST_ASSERT_EQUAL_STRING("OPEN", collectionGateName(f.monitor.collectionGate()));
+        TEST_ASSERT_EQUAL_STRING("RMSSD_UNSTABLE", collectionGateName(f.monitor.restingGate()));
+    }
+    TEST_ASSERT_TRUE(f.monitor.shortAvailable());
+    TEST_ASSERT_EQUAL_UINT(60, f.monitor.sampleCount());
+    TEST_ASSERT_GREATER_THAN_FLOAT(110, f.monitor.shortReference());
+    f.input.interventionActive = true;
+    f.tick();
+    TEST_ASSERT_EQUAL_STRING("HAPTIC_ACTIVE_OR_STOP_PENDING", collectionGateName(f.monitor.collectionGate()));
+    f.input.interventionActive = false;
+    f.input.signalGood = false;
+    f.tick();
+    TEST_ASSERT_EQUAL_STRING("SIGNAL_OR_IMU", collectionGateName(f.monitor.collectionGate()));
+    f.input.signalGood = true;
+    f.input.motion = Motion::MODERATE_MOTION;
+    f.tick();
+    TEST_ASSERT_EQUAL_STRING("MOTION", collectionGateName(f.monitor.collectionGate()));
+}
+
 int main()
 {
     UNITY_BEGIN();
+    RUN_TEST(test_short_adapts_to_trends_but_retains_quality_gates);
+    RUN_TEST(test_p1_continues_through_p2_and_resets_only_above_p1_boundary);
+    RUN_TEST(test_p2_restart_does_not_borrow_time_or_reset_p1);
     RUN_TEST(test_requires_one_minute_and_prefers_five);
     RUN_TEST(test_median_uses_middle_pair_and_resists_outlier);
     RUN_TEST(test_partial_or_bad_quality_blocks_do_not_count);
     RUN_TEST(test_old_readings_expire_in_wall_time);
-    RUN_TEST(test_ten_percent_drop_keeps_short_reference_adapting);
+    RUN_TEST(test_ten_percent_drop_triggers_p1_at_the_configured_five_percent_threshold);
     RUN_TEST(test_both_paths_trigger_at_30_and_120_seconds);
     RUN_TEST(test_short_path_does_not_require_long_term_baseline);
     RUN_TEST(test_long_term_path_does_not_require_short_reference);

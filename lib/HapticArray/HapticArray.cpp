@@ -22,7 +22,7 @@ Array::Array(I2cBus &bus, const ArrayConfig &config) : bus_(bus), config_(config
 
 bool Array::select(unsigned motor)
 {
-    if (motor >= MOTOR_COUNT || config_.channels[motor] > 7) return false;
+    if (!configuredMotor(motor) || config_.channels[motor] > 7) return false;
     const uint8_t mask = static_cast<uint8_t>(1U << config_.channels[motor]);
     return bus_.write(config_.muxAddress, &mask, 1);
 }
@@ -68,12 +68,13 @@ bool Array::begin()
     errorMotor_ = faultBits_ = 0;
     warningBits_ = 0;
     if (config_.muxAddress < 0x70 || config_.muxAddress > 0x77 ||
-        config_.driverAddress != 0x4A)
+        config_.driverAddress != 0x4A || config_.motorCount == 0 ||
+        config_.motorCount > MOTOR_COUNT || config_.outputScalePercent > 100)
     {
         error_ = ArrayError::CONFIG;
         return false;
     }
-    for (unsigned i = 0; i < MOTOR_COUNT; ++i)
+    for (unsigned i = 0; i < config_.motorCount; ++i)
     {
         if (config_.channels[i] > 7) { error_ = ArrayError::CONFIG; return false; }
         for (unsigned j = 0; j < i; ++j)
@@ -82,7 +83,7 @@ bool Array::begin()
     }
 
     if (!disconnect()) return fail(ArrayError::I2C);
-    for (unsigned motor = 0; motor < MOTOR_COUNT; ++motor)
+    for (unsigned motor = 0; motor < config_.motorCount; ++motor)
     {
         uint8_t revision;
         if (!select(motor) || !readReg(reg::CHIP_REV, revision))
@@ -112,11 +113,13 @@ bool Array::begin()
     return pollFaults();
 }
 
-uint8_t Array::amplitudeCode(uint16_t level)
+uint8_t Array::amplitudeCode(uint16_t level, uint8_t scalePercent)
 {
     if (level > 1000) level = 1000;
+    if (scalePercent > 100) scalePercent = 100;
     // With acceleration enabled, DRO input is 0..127, not 0..255.
-    return static_cast<uint8_t>((static_cast<uint32_t>(level) * 127 + 500) / 1000);
+    return static_cast<uint8_t>(
+        (static_cast<uint32_t>(level) * 127 * scalePercent + 50000UL) / 100000UL);
 }
 
 bool Array::apply(const Frame &frame)
@@ -126,9 +129,9 @@ bool Array::apply(const Frame &frame)
     // Switching the mux does not stop the previously addressed DA7280.
     for (unsigned pass = 0; pass < 2; ++pass)
     {
-        for (unsigned motor = 0; motor < MOTOR_COUNT; ++motor)
+        for (unsigned motor = 0; motor < config_.motorCount; ++motor)
         {
-            uint8_t next = amplitudeCode(frame.level[motor]);
+            uint8_t next = amplitudeCode(frame.level[motor], config_.outputScalePercent);
             if (next == levels_[motor]) continue;
             bool reduction = next < levels_[motor];
             if (reduction != (pass == 0)) continue;
@@ -154,7 +157,7 @@ bool Array::apply(const Frame &frame)
 bool Array::pollFaults()
 {
     if (!ready_) return false;
-    for (unsigned motor = 0; motor < MOTOR_COUNT; ++motor)
+    for (unsigned motor = 0; motor < config_.motorCount; ++motor)
     {
         uint8_t events, status;
         if (!select(motor) || !readReg(reg::IRQ_EVENT1, events) ||
@@ -185,7 +188,7 @@ bool Array::pollFaults()
 bool Array::outputStopPending() const
 {
     if (!shutdownPending_) return false;
-    for (unsigned motor = 0; motor < MOTOR_COUNT; ++motor)
+    for (unsigned motor = 0; motor < config_.motorCount; ++motor)
         if (driving_[motor]) return true;
     return false;
 }
@@ -193,7 +196,7 @@ bool Array::outputStopPending() const
 bool Array::stopAll()
 {
     bool ok = true;
-    for (unsigned motor = 0; motor < MOTOR_COUNT; ++motor)
+    for (unsigned motor = 0; motor < config_.motorCount; ++motor)
     {
         if (!select(motor)) { ok = false; continue; }
         // Do not short-circuit: try both stop writes even if one fails.

@@ -172,8 +172,10 @@ Events Monitor::update(const Input &in)
     else restingGate_ = CollectionGate::OPEN;
 
     // The live short reference continues collecting through pending triggers
-    // and latched episodes. Only the resting quality gates pause adaptation.
-    collectionGate_ = restingGate_;
+    // and latched episodes. A changing RMSSD is not invalid data: only the
+    // fixed resting baseline/rearm still require the stability gate.
+    collectionGate_ = restingGate_ == CollectionGate::UNSTABLE
+                          ? CollectionGate::OPEN : restingGate_;
     bool canCollect = collectionGate_ == CollectionGate::OPEN;
     if (!canCollect && sampleBlock_.active) ++collectionBreaks_;
     sampleBlock_.update(canCollect, in.now);
@@ -197,12 +199,15 @@ Events Monitor::update(const Input &in)
     float sessionDrop = deviation(in.current, sessionValue);
     float shortDrop = deviation(in.current, shortValue_);
 
-    p1Long_.update(qualifies && longReady && longDrop >= 20, in.now);
-    p2Long_.update(qualifies && longReady && longDrop >= 30, in.now);
-    p1Session_.update(qualifies && sessionReady && sessionDrop >= 20, in.now);
-    p2Session_.update(qualifies && sessionReady && sessionDrop >= 30, in.now);
-    p1Short_.update(qualifies && shortReady_ && shortDrop >= 20, in.now);
-    p2Short_.update(qualifies && shortReady_ && shortDrop >= 30, in.now);
+    // These are overlapping conditions, not exclusive P1/P2 zones. Entering
+    // or leaving P2 preserves P1's original start while its drop still qualifies.
+    // With valid input, P1 resets only above its RMSSD boundary (drop < P1).
+    p1Long_.update(qualifies && longReady && longDrop >= P1_DROP_PCT, in.now);
+    p2Long_.update(qualifies && longReady && longDrop >= P2_DROP_PCT, in.now);
+    p1Session_.update(qualifies && sessionReady && sessionDrop >= P1_DROP_PCT, in.now);
+    p2Session_.update(qualifies && sessionReady && sessionDrop >= P2_DROP_PCT, in.now);
+    p1Short_.update(qualifies && shortReady_ && shortDrop >= P1_DROP_PCT, in.now);
+    p2Short_.update(qualifies && shortReady_ && shortDrop >= P2_DROP_PCT, in.now);
     if (!p1Fired_)
     {
         events.p1 = completed(p1Long_, p1Short_, p1Session_, in.now, P1_HOLD_MS);
