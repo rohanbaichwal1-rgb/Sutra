@@ -7,10 +7,10 @@ cannot interrupt P2.
 
 The RMSSD drop thresholds remain 5% for P1 and 10% for P2, with trigger holds
 of 30 seconds and 120 seconds respectively. These playback durations include
-the existing pattern's quiet intervals. With only Motor 1 connected, P2 drives
-it during 0–1.3 seconds and 6–10 seconds; the other phases are silent.
+the existing pattern's quiet intervals. All three motors are enabled: P1 taps
+independently across the array, and P2 follows the left/right/center sweep below.
 
-The current single-motor firmware sets `ArrayConfig::outputScalePercent = 40`.
+The current three-motor firmware sets `ArrayConfig::outputScalePercent = 40`.
 It scales the original 0–100% envelope into 0–40%, preserving ramps and pauses
 instead of forcing a fixed ON intensity. P1's original 90% taps become 36%;
 P2's 10–50% ramps become 4–20%, its 60% hold becomes 24%, and its 30–0%
@@ -81,7 +81,7 @@ toward or away from P6.
 
 ## Runtime status and faults
 
-Every boot runs a separate five-second continuous `BOOT_TEST` on Motor 1 / CH0
+Every boot runs a separate ten-second continuous `BOOT_TEST` on all three motors
 after haptic initialization and before sensor initialization. It uses the 40%
 output limit (raw DRO code 51), polls faults every 100 ms, and stops on failure.
 No sensor samples or P1/P2 threshold events are generated during this check.

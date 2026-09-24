@@ -304,6 +304,56 @@ void test_scaled_intensity_preserves_p1_p2_envelopes()
     assertStopped(bus, 0);
 }
 
+void test_three_motor_patterns_keep_scaled_levels_and_spatial_routing()
+{
+    FakeBus bus;
+    ArrayConfig config;
+    config.motorCount = 3;
+    config.outputScalePercent = 40;
+    Array driver(bus, config);
+    Patterns p;
+    TEST_ASSERT_TRUE(driver.begin());
+    TEST_ASSERT_TRUE(p.startP1(0, 12345));
+    bool sawTap[3] = {false, false, false};
+    for (uint32_t t = 0; t <= 5000; t += 10)
+    {
+        const Frame &frame = p.update(t);
+        TEST_ASSERT_TRUE(driver.apply(frame));
+        for (unsigned ch = 0; ch < 3; ++ch)
+        {
+            const uint8_t expected = frame.level[ch] ? 46 : 0;
+            TEST_ASSERT_EQUAL_UINT8(expected, bus.registers[ch][0x23]);
+            if (expected) sawTap[ch] = true;
+        }
+        TEST_ASSERT_EQUAL_UINT8(0, bus.mux);
+    }
+    for (unsigned ch = 0; ch < 3; ++ch) TEST_ASSERT_TRUE(sawTap[ch]);
+    TEST_ASSERT_FALSE(p.active());
+    TEST_ASSERT_TRUE(driver.stopAll());
+
+    // Raw DRO codes retain the existing 40% scaling of the document's envelope.
+    const uint32_t times[] = {0, 650, 1299, 1300, 1950, 2599, 2600,
+                              4000, 5000, 6000, 8000, 10000};
+    const uint8_t expected[][3] = {
+        {5, 0, 0}, {15, 0, 0}, {25, 0, 0}, {0, 0, 5},
+        {0, 0, 15}, {0, 0, 25}, {0, 30, 0}, {0, 30, 0},
+        {0, 23, 0}, {15, 0, 15}, {8, 0, 8}, {0, 0, 0}
+    };
+    TEST_ASSERT_TRUE(p.startP2(10000));
+    for (unsigned i = 0; i < sizeof(times) / sizeof(times[0]); ++i)
+    {
+        TEST_ASSERT_TRUE(driver.apply(p.update(10000 + times[i])));
+        for (unsigned ch = 0; ch < 3; ++ch)
+            TEST_ASSERT_EQUAL_UINT8(expected[i][ch], bus.registers[ch][0x23]);
+        TEST_ASSERT_EQUAL_UINT8(0, bus.mux);
+    }
+    TEST_ASSERT_FALSE(p.active());
+    TEST_ASSERT_TRUE(driver.stopAll());
+    for (unsigned ch = 0; ch < 3; ++ch) assertStopped(bus, ch);
+    for (const auto &w : bus.writes) TEST_ASSERT_LESS_THAN_UINT(3, w.channel);
+    TEST_ASSERT_FALSE(bus.multiChannelWrite);
+}
+
 void test_intensity_scale_rejects_out_of_range_percent()
 {
     FakeBus bus;
@@ -483,11 +533,11 @@ void test_lost_playback_ack_blocks_collection_until_output_stops()
     assertStopped(bus, 1);
 }
 
-void test_boot_check_is_continuous_for_five_seconds_on_motor_one()
+void test_boot_check_is_continuous_for_ten_seconds_on_all_three_motors()
 {
     FakeBus bus;
     ArrayConfig config;
-    config.motorCount = 1;
+    config.motorCount = 3;
     config.outputScalePercent = 40;
     Array driver(bus, config);
     Patterns p;
@@ -495,21 +545,26 @@ void test_boot_check_is_continuous_for_five_seconds_on_motor_one()
     TEST_ASSERT_TRUE(driver.begin());
     const uint32_t start = UINT32_MAX - 2000;
     TEST_ASSERT_TRUE(p.startBootTest(start));
+    TEST_ASSERT_EQUAL_UINT32(10000, p.durationMs());
     playback.started(Protocol::BOOT_TEST);
     TEST_ASSERT_FALSE(p.startBootTest(start)); // no duplicate start while running
-    for (uint32_t elapsed = 0; elapsed < 5000; elapsed += 10)
+    for (uint32_t elapsed = 0; elapsed < 10000; elapsed += 10)
     {
-        assertFrame(p.update(start + elapsed), 1000, 0, 0);
+        assertFrame(p.update(start + elapsed), 1000, 1000, 1000);
         TEST_ASSERT_TRUE(driver.apply(p.frame()));
         TEST_ASSERT_TRUE(driver.pollFaults());
-        TEST_ASSERT_EQUAL_UINT8(51, bus.registers[0][0x23]);
+        for (unsigned ch = 0; ch < 3; ++ch)
+        {
+            TEST_ASSERT_EQUAL_UINT8(51, bus.registers[ch][0x23]);
+            TEST_ASSERT_EQUAL_UINT8(1, bus.registers[ch][0x22]);
+        }
         TEST_ASSERT_EQUAL_UINT8(0, bus.mux);
     }
-    assertFrame(p.update(start + 5000), 0, 0, 0);
+    assertFrame(p.update(start + 10000), 0, 0, 0);
     TEST_ASSERT_FALSE(p.active());
     TEST_ASSERT_TRUE(driver.stopAll());
     playback.finished(true);
-    assertStopped(bus, 0);
+    for (unsigned ch = 0; ch < 3; ++ch) assertStopped(bus, ch);
     TEST_ASSERT_EQUAL_STRING("COMPLETED", playbackName(playback.state(Protocol::BOOT_TEST)));
     TEST_ASSERT_EQUAL_STRING("NOT_STARTED", playbackName(playback.state(Protocol::P1_FLUTTER)));
     TEST_ASSERT_EQUAL_STRING("NOT_STARTED", playbackName(playback.state(Protocol::P2_SWEEP)));
@@ -519,7 +574,7 @@ void test_boot_undervoltage_fails_and_cannot_restart()
 {
     FakeBus bus;
     ArrayConfig config;
-    config.motorCount = 1;
+    config.motorCount = 3;
     config.outputScalePercent = 40;
     Array driver(bus, config);
     Patterns p;
@@ -528,11 +583,12 @@ void test_boot_undervoltage_fails_and_cannot_restart()
     p.startBootTest(0);
     TEST_ASSERT_TRUE(driver.apply(p.frame()));
     playback.started(Protocol::BOOT_TEST);
-    bus.registers[0][0x03] = 0x02;
+    bus.registers[1][0x03] = 0x02;
     TEST_ASSERT_FALSE(driver.pollFaults());
+    TEST_ASSERT_EQUAL_UINT8(2, driver.errorMotor());
     p.stop();
     playback.finished(false);
-    assertStopped(bus, 0);
+    for (unsigned ch = 0; ch < 3; ++ch) assertStopped(bus, ch);
     TEST_ASSERT_EQUAL_STRING("FAILED", playbackName(playback.state(Protocol::BOOT_TEST)));
     TEST_ASSERT_FALSE(driver.ready());
     TEST_ASSERT_FALSE(driver.apply(p.frame()));
@@ -561,7 +617,7 @@ void test_playback_outcomes_do_not_confuse_preemption_failure_and_completion()
 int main()
 {
     UNITY_BEGIN();
-    RUN_TEST(test_boot_check_is_continuous_for_five_seconds_on_motor_one);
+    RUN_TEST(test_boot_check_is_continuous_for_ten_seconds_on_all_three_motors);
     RUN_TEST(test_boot_undervoltage_fails_and_cannot_restart);
     RUN_TEST(test_playback_outcomes_do_not_confuse_preemption_failure_and_completion);
     RUN_TEST(test_p2_inhale_boundaries_and_ramps);
@@ -573,6 +629,7 @@ int main()
     RUN_TEST(test_driver_outer_motors_continue_together_after_mux_disconnect);
     RUN_TEST(test_single_motor_configuration_only_requires_channel_zero);
     RUN_TEST(test_scaled_intensity_preserves_p1_p2_envelopes);
+    RUN_TEST(test_three_motor_patterns_keep_scaled_levels_and_spatial_routing);
     RUN_TEST(test_intensity_scale_rejects_out_of_range_percent);
     RUN_TEST(test_intensity_scale_mapping_and_limits);
     RUN_TEST(test_driver_stops_old_motor_before_sweep_handoff);

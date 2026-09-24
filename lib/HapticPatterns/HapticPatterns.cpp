@@ -26,10 +26,11 @@ bool Patterns::startBootTest(uint32_t now)
 {
     if (active()) return false;
     startedMs_ = now;
-    durationMs_ = 5000UL;
+    durationMs_ = 10000UL;
     protocol_ = Protocol::BOOT_TEST;
     frame_ = Frame{};
-    frame_.level[0] = 1000; // Array's 40% scaling applies; only motor 1.
+    for (unsigned motor = 0; motor < MOTOR_COUNT; ++motor)
+        frame_.level[motor] = 1000; // Array's existing 40% scaling applies.
     return true;
 }
 
