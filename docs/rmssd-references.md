@@ -14,6 +14,24 @@ even before seven saved sessions. Before that, the short path can work alone.
 An established seven-session baseline is restored and available at startup.
 Sessions simulate days for prototype testing; no calendar dates are used.
 
+```mermaid
+flowchart TD
+    IBI[Accepted individual IBI] --> Gate{300-2000 ms and<br/>within 20% of last accepted IBI?}
+    Gate -- No --> Reject[Exclude from RMSSD/PDR]
+    Gate -- Yes --> Window[60 s RMSSD window]
+    Window --> RMSSD[sqrt(mean(successive IBI difference squared))]
+    RMSSD --> Quality{Fresh signal, valid IMU,<br/>LOW motion, no haptics?}
+    Quality -- No --> Pause[Pause collection and continuous holds]
+    Quality -- Yes --> Refs[Compare session, short, and personal references]
+    Refs --> P2{Drop >=10% for 120 s?}
+    P2 -- Yes --> P2Fire[Trigger P2]
+    P2 -- No --> P1{Drop >=5% for 30 s?}
+    P1 -- Yes --> P1Fire[Trigger P1]
+    P1 -- No --> Refs
+    P1Fire --> Rearm[60 s stable recovery below 10% drop]
+    P2Fire --> Rearm
+```
+
 ## Current session and saved sessions
 
 Each startup collects one reading after each complete five-second block of LOW

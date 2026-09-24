@@ -1787,8 +1787,20 @@ haptics::ArrayConfig singleMotorHapticConfig()
     config.outputScalePercent = 40; // Map the original 0..100% envelope to 0..40%.
     return config;
 }
+haptics::ArrayConfig threeMotorBootCheckConfig()
+{
+    haptics::ArrayConfig config;
+    config.motorCount = haptics::MOTOR_COUNT;
+    config.channels[0] = 0;
+    config.channels[1] = 1;
+    config.channels[2] = 2;
+    config.outputScalePercent = 40;
+    return config;
+}
 haptics::ArrayConfig hapticArrayConfig = singleMotorHapticConfig();
 haptics::Array hapticArray(hapticBus, hapticArrayConfig);
+haptics::ArrayConfig bootCheckArrayConfig = threeMotorBootCheckConfig();
+haptics::Array bootCheckArray(hapticBus, bootCheckArrayConfig);
 haptics::Patterns hapticPatterns;
 bool hapticPatternActive = false;
 bool hapticFaultReported = false;
@@ -1931,6 +1943,52 @@ void startHapticProtocol(haptics::Protocol protocol, uint32_t nowMs)
     reportHapticFault();
 }
 
+// Startup-only hardware check. It deliberately uses a separate three-motor
+// array so normal P1/P2 playback remains on the configured single motor.
+void runStartupMotorCheck()
+{
+    Serial.println("[HAPTIC] BOOT_TEST: all three motors for 10s at 40%; confirm by touch");
+    if (!bootCheckArray.begin())
+    {
+        Serial.print("[HAPTIC] BOOT_TEST failed to initialize | Motor:");
+        Serial.print(bootCheckArray.errorMotor());
+        Serial.print(" | FaultBits:0x");
+        Serial.println(bootCheckArray.faultBits(), HEX);
+        return;
+    }
+
+    haptics::Patterns bootPattern;
+    const uint32_t startedMs = millis();
+    bool ok = bootPattern.startBootTest(startedMs) &&
+              bootCheckArray.apply(bootPattern.frame());
+    uint32_t lastFaultPollMs = startedMs;
+
+    while (ok && bootPattern.active())
+    {
+        const uint32_t nowMs = millis();
+        bootPattern.update(nowMs);
+        if (!bootPattern.active())
+            break;
+        if (nowMs - lastFaultPollMs >= HAPTIC_FAULT_POLL_MS)
+        {
+            lastFaultPollMs = nowMs;
+            ok = bootCheckArray.pollFaults();
+        }
+        delay(1);
+    }
+
+    const bool stopped = bootCheckArray.stopAll();
+    if (ok && stopped && bootCheckArray.ready())
+        Serial.println("[HAPTIC] BOOT_TEST passed; all motors stopped");
+    else
+    {
+        Serial.print("[HAPTIC] BOOT_TEST failed | Motor:");
+        Serial.print(bootCheckArray.errorMotor());
+        Serial.print(" | FaultBits:0x");
+        Serial.println(bootCheckArray.faultBits(), HEX);
+    }
+}
+
 // RMSSD can remain mathematically valid while its last accepted beat is old.
 // Require fresh RMSSD input as well as the existing LMS-HR validity gate.
 bool isReferenceInputFresh(uint32_t nowMs)
@@ -2040,6 +2098,7 @@ void setup()
     Wire.setClock(I2C_SPEED);
     Wire.setTimeOut(10); // Bound failed I2C transfers, including mux branches.
     delay(2);            // DA7280 cold-boot allowance; no delays in the playback sequencer.
+    runStartupMotorCheck();
     // Sensor initialization continues if the haptic array is absent/faulty.
     Serial.println("[Startup] Checking haptic mux/drivers...");
     if (hapticArray.begin())

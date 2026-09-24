@@ -6,6 +6,26 @@ RIIV and inhale/exhale phase synchronization are not implemented.
 
 ## Inputs and estimator
 
+```mermaid
+flowchart TD
+    Beat[Accepted LMS beat] --> Input[Timestamp + cleaned crest amplitude + individual IBI]
+    Input --> Queue[Bounded zero-wait queue]
+    Queue --> Worker[Core 0 PDR worker]
+    Worker --> Gates{Fresh signal,<br/>LOW motion, no beat gap over 2.5 s?}
+    Gates -- No --> Clear[Clear respiratory history and holds]
+    Gates -- Yes --> Window[60 s beat history; interpolate to 4 Hz]
+    Window --> Channels[RIAV amplitude and RIFV interval channels]
+    Channels --> Fit[Detrend + Hann-weighted sinusoid fit: 4-30 br/min]
+    Fit --> Quality{Quality >=70 and,<br/>if both, agreement within 2/min?}
+    Quality -- No --> Invalid[WEAK or DISAGREE]
+    Quality -- Yes --> Rate[Valid respiratory-rate estimate]
+    Rate --> Baseline[Collect stable 5 s blocks toward 180 s baseline]
+    Baseline --> Support[Absolute deviation >=20% for 20 s: PDR_SUPPORT]
+```
+
+PDR is deliberately downstream-only: the support flag is reported beside P1/P2
+but is never fed into the RMSSD trigger decision.
+
 After LMS rhythm acquisition, each beat accepted by both the existing robust IBI
 check and RMSSD artifact check sends its crest timestamp, cleaned crest amplitude
 and unsmoothed individual IBI to PDR. Reconstructed acquisition intervals are not

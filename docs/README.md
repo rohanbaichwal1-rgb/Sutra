@@ -77,6 +77,7 @@ gantt
 ## Detailed documents
 
 - [Haptic protocols](haptic-protocols.md) — wiring scope, patterns, output scaling, and faults.
+- [LMS and Elgendi pipeline](lms-elgendi.md) — PPG cleaning, beat acceptance, variables, and signal-quality gates.
 - [RMSSD references](rmssd-references.md) — baselines, trigger holds, recovery, and persistence.
 - [PDR observer](pdr-observer.md) — respiration estimation and its non-gating role.
 - [BLE telemetry](ble-telemetry.md) — service UUIDs, grouped fields, and notification behaviour.

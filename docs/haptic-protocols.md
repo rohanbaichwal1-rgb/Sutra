@@ -95,12 +95,31 @@ toward or away from P6.
 
 ## Runtime status and faults
 
-Startup probes the configured mux branch and DA7280 driver, but it does **not**
-automatically run the library's `BOOT_TEST` pattern. That pattern remains a
-host-tested generator capability (ten seconds, all three logical channels), not
-an application startup action. Sensor initialization continues when the haptic
-array is unavailable, so RMSSD reference collection is not blocked by absent
-haptic hardware.
+```mermaid
+flowchart TD
+    Trigger[RMSSD P1 or P2 event] --> Priority{P2 active or requested?}
+    Priority -- P2 --> P2[P2 replaces P1; start paced sweep]
+    Priority -- P1 only --> P1[Start 5 s random flutter]
+    P1 --> Frame[Service envelope every about 10 ms]
+    P2 --> Frame
+    Frame --> Poll[Poll DA7280 faults every 100 ms]
+    Poll --> OK{I2C and driver healthy?}
+    OK -- Yes --> Done{Pattern complete?}
+    Done -- No --> Frame
+    Done -- Yes --> Stop[Write zero amplitude and inactive mode]
+    OK -- No --> Fault[Stop all configured channels; latch fault]
+    Fault --> Retry[Retry uncertain stop every 250 ms]
+```
+
+The transport uses TCA9548A channel selection to address one identical-address
+DA7280 at a time. A previously addressed driver keeps its amplitude after mux
+disconnect, so multi-motor envelopes can overlap when configured.
+
+Before sensor initialization, startup runs `BOOT_TEST`: all three logical motors
+on mux channels 0–2 receive the 40%-capped command for ten seconds. Confirm each
+motor physically by touch. The test uses a separate three-motor array; normal
+P1/P2 playback remains configured for Motor 1 only. If a test branch is missing
+or faults, the failure is logged and sensor initialization continues.
 
 While a protocol is playing, frames are serviced about every 10 ms and driver
 fault registers are polled every 100 ms. At normal completion the firmware sends
