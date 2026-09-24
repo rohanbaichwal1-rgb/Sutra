@@ -1,16 +1,30 @@
-# Three-motor haptic actuation
+# Haptic actuation
 
 The PoC uses the existing RMSSD P1/P2 events. It does not invent a State Alpha
 classifier or confidence score. P1 runs for five seconds; P2 runs for one complete
 ten-second breathing cycle for testing. P2 replaces an active P1; a P1 request
 cannot interrupt P2.
 
+## Current hardware scope
+
+The pattern library and transport are designed for up to three logical motors,
+but the checked-in firmware currently enables **one** SmartElex DA7280 module:
+Motor 1 on TCA9548A channel 0. The left/centre/right descriptions below document
+the three-channel pattern design and its host tests; they are not a claim that
+the production configuration currently drives channels 1 and 2. With the current
+`motorCount = 1` configuration, only the Motor 1 portions of P1 and P2 are sent.
+
+Adding the remaining modules requires wiring them to distinct mux channels and
+changing the firmware configuration deliberately. It is not enabled merely by
+using the three-motor pattern generator.
+
 The RMSSD drop thresholds remain 5% for P1 and 10% for P2, with trigger holds
 of 30 seconds and 120 seconds respectively. These playback durations include
-the existing pattern's quiet intervals. All three motors are enabled: P1 taps
-independently across the array, and P2 follows the left/right/center sweep below.
+the existing pattern's quiet intervals. The reusable pattern generator supports
+independent P1 taps across all three positions and the P2 left/right/centre sweep
+below. The currently enabled single module receives only its Motor 1 frames.
 
-The current three-motor firmware sets `ArrayConfig::outputScalePercent = 40`.
+The current single-motor firmware sets `ArrayConfig::outputScalePercent = 40`.
 It scales the original 0–100% envelope into 0–40%, preserving ramps and pauses
 instead of forcing a fixed ON intensity. P1's original 90% taps become 36%;
 P2's 10–50% ramps become 4–20%, its 60% hold becomes 24%, and its 30–0%
@@ -25,11 +39,11 @@ handling and motor electrical settings are unchanged. The library default of
 The existing XIAO ESP32S3 I2C bus uses GPIO 5 for SDA and GPIO 6 for SCL at 400 kHz.
 The MAX30101 and BMI270 remain on that root bus. The TCA9548A address is `0x70`.
 
-| Logical motor | Position | Mux channel | DA7280 address |
-|---|---|---|---|
-| Motor 1 | Left | 0 | `0x4A` |
-| Motor 2 | Center / P6 | 1 | `0x4A` |
-| Motor 3 | Right | 2 | `0x4A` |
+| Logical motor | Position | Mux channel | DA7280 address | Enabled now |
+|---|---|---|---|---|
+| Motor 1 | Left | 0 | `0x4A` | Yes |
+| Motor 2 | Center / P6 | 1 | `0x4A` | No — design/test mapping |
+| Motor 3 | Right | 2 | `0x4A` | No — design/test mapping |
 
 The driver selects exactly one channel for each addressed motor, checks I2C
 results, and deselects all channels before returning to the sensor code. Each
@@ -37,7 +51,7 @@ DA7280 continues its amplitude independently after deselection, allowing both
 outer motors to run during exhale. These are three separate driver modules;
 the mux does not provide motor power or directly drive an LRA.
 
-This setup targets the onboard LRAs of the supplied SmartElex modules. It retains
+This setup targets the onboard LRA of the supplied SmartElex module. It retains
 the existing/default DA7280 actuator voltage, current, impedance, and frequency
 registers; the SmartElex manual does not publish a motor-specific replacement
 profile. It does not substitute SparkFun's `defaultMotor()` values. This is not
@@ -81,43 +95,27 @@ toward or away from P6.
 
 ## Runtime status and faults
 
-Every boot runs a separate ten-second continuous `BOOT_TEST` on all three motors
-after haptic initialization and before sensor initialization. It uses the 40%
-output limit (raw DRO code 51), polls faults every 100 ms, and stops on failure.
-No sensor samples or P1/P2 threshold events are generated during this check.
-It does not retry a latched fault. `BootTest` remains in the System report so
-the result is visible even if the serial monitor connects after startup.
-Completion confirms the command sequence and acknowledged shutdown, not measured
-physical vibration; confirm the motor response by touch. A 0x02 fault is labelled
-`UNDERVOLTAGE`; the module supply/wiring must be checked under motor-start load.
+Startup probes the configured mux branch and DA7280 driver, but it does **not**
+automatically run the library's `BOOT_TEST` pattern. That pattern remains a
+host-tested generator capability (ten seconds, all three logical channels), not
+an application startup action. Sensor initialization continues when the haptic
+array is unavailable, so RMSSD reference collection is not blocked by absent
+haptic hardware.
 
-P1/P2 reports separate threshold `Triggered` from last-attempt `Playback`:
-`NOT_STARTED`, `STARTED`, `COMPLETED`, `FAILED`, `PREEMPTED`, or `SUPPRESSED`.
-`Action` explains `PLAYING`, `WAIT_RECOVERY`, `MOTOR_FAULT`, `P2_PRIORITY`,
-`NO_REFERENCE`, `INVALID_INPUT`, `MOTION_PAUSED`, `POST_EXERCISE`, or `MONITORING`.
-Timers can still exceed their hold duration after the episode fires; this is
-not another motor command. Playback failure does not clear threshold latches or
-bypass the existing recovery requirement. A P2 start can preempt active P1;
-simultaneous threshold events give P2 priority. Negative deviation is unchanged.
+While a protocol is playing, frames are serviced about every 10 ms and driver
+fault registers are polled every 100 ms. At normal completion the firmware sends
+a stop command and logs `[HAPTIC] protocol complete`. I2C failures and driver
+faults stop the sequence; shutdown is retried every 250 ms if its acknowledgement
+is uncertain. `FAULT_STOP_PENDING` means the firmware cannot yet confirm a stop.
+Haptic state is reported as `OFF`, `P1_FLUTTER`, `P2_SWEEP`, `FAULT`, or
+`FAULT_STOP_PENDING`.
 
-The compact report shows `Haptic:OFF`, `P1_FLUTTER`, or `P2_SWEEP`, plus elapsed
-and total intervention seconds. Protocol starts/completion and hardware errors
-are separate event lines. Reference collection/recovery sees the entire
-intervention as active, including gaps between taps.
-
-Driver fault registers are checked before starting and every 100 ms while
-playing. I2C failures and motor/temperature faults stop the sequence and attempt
-zero-amplitude/inactive writes on all three channels. Faults latch until reboot.
-Failed stop writes are retried every 250 ms. `FAULT_STOP_PENDING` is displayed
-and reference adaptation stays blocked if a motor commanded into playback has
-not acknowledged shutdown. Playback is tracked before sending the start command,
-so losing its acknowledgement also requires a confirmed stop. A startup failure
-before any playback command displays `FAULT` and does not count as an active
-intervention: missing haptic hardware no longer prevents short-reference
-collection. Haptics stay disabled until reboot. Software cannot guarantee
-stopping an unreachable powered driver; the playback tracking is local to this
-firmware run and is not a measurement of physical vibration. The I2C transfer
-timeout is bounded at 10 ms.
+P2 has priority when P1 and P2 trigger together, and P2 immediately replaces an
+active P1. A P1 request never interrupts P2. Reference collection/recovery sees
+the whole intervention as active, including P1 gaps. Haptics remain disabled
+after a latched driver fault until reboot. Software can confirm commands and I2C
+acknowledgements, not physical vibration; confirm motor response by touch. The
+I2C transfer timeout is bounded at 10 ms.
 
 ## Files and validation
 
@@ -126,7 +124,8 @@ timeout is bounded at 10 ms.
 - `src/HapticWireBus.h`: Arduino Wire adapter.
 - `src/main.cpp`: RMSSD triggers, hardware setup, playback servicing, and status.
 - `test/test_haptics`: phase boundaries, independent bursts, rollover, priority,
-  simultaneous outer outputs, mux isolation, and fault/shutdown behavior.
+  three-channel routing, mux isolation, amplitude scaling, and fault/shutdown
+  behavior.
 
 Build: `pio run -e seeed_xiao_esp32s3`
 
