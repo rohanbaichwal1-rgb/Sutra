@@ -32,6 +32,15 @@
      co-timed threshold, instead of mixing in the current sample's
      envelope/threshold, removing a 1-sample timing skew.
 */
+// BLE switch: 1 = ON, 0 = OFF. Rebuild and upload after changing.
+// Serial reporting, sensing, and haptics remain enabled in either mode.
+#ifndef SUTRA_BLE_ENABLED
+#define SUTRA_BLE_ENABLED 0
+#endif
+#if SUTRA_BLE_ENABLED != 0 && SUTRA_BLE_ENABLED != 1
+#error "SUTRA_BLE_ENABLED must be 0 or 1"
+#endif
+
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
@@ -2245,7 +2254,11 @@ void setup()
     // Serial.println();
 
     Serial.println(pdrService::begin() ? "[PDR] Observer started (context only)" : "[PDR] Task allocation failed");
+#if SUTRA_BLE_ENABLED
     Serial.println(telemetry::begin() ? "[BLE] Starting Sutra telemetry" : "[BLE] Task allocation failed");
+#else
+    Serial.println("[BLE] Disabled by SUTRA_BLE_ENABLED=0; serial telemetry remains active");
+#endif
     tsLastReport = millis();
     rateWindowStartMs = millis();
 }
@@ -2472,10 +2485,16 @@ void loop()
             snapshot.hapticElapsedMs = hapticPatterns.elapsedMs(millis());
             snapshot.hapticDurationMs = hapticPatterns.durationMs();
         }
+#if SUTRA_BLE_ENABLED
         snprintf(snapshot.bleState, sizeof(snapshot.bleState), "%s", telemetry::state());
+#else
+        snprintf(snapshot.bleState, sizeof(snapshot.bleState), "OFF");
+#endif
         newCleanedIBIAvailable = false;
         maxLoopGapUs = 0;
+#if SUTRA_BLE_ENABLED
         telemetry::publish(snapshot);
+#endif
 
         // Both transports use identical, labeled, newline-terminated groups.
         char line[telemetry::LINE_CAPACITY];

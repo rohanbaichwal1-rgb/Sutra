@@ -1,5 +1,25 @@
 # BLE telemetry
 
+## Enable or disable BLE
+
+Near the top of `src/main.cpp`, set:
+
+```cpp
+#define SUTRA_BLE_ENABLED 1 // 1 = ON, 0 = OFF
+```
+
+With `0`, main does not start the BLE task or publish BLE snapshots, so the
+device does not advertise or accept BLE connections. Serial telemetry continues
+and reports `BLE:OFF`; sensor processing and haptic settings are unchanged.
+This main-file switch controls calls into the separately compiled BLE module;
+it is not a guarantee that every Bluetooth library is excluded from compilation.
+Only 0 and 1 are accepted. Rebuild and upload after changing the setting.
+An explicit `-DSUTRA_BLE_ENABLED=0` or `=1` in PlatformIO `build_flags` overrides
+the main-file default. Uploading erases saved sessions under the existing
+erase-on-upload setting; an ordinary reset does not change this switch.
+
+## Connection
+
 The device advertises as **Sutra** after the required sensors initialize. Use a
 generic BLE GATT explorer on Android, connect, open the service below, and read
 or subscribe to the characteristics. Select UTF-8/text display rather than hex.
