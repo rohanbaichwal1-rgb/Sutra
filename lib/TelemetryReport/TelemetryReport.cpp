@@ -38,6 +38,12 @@ void age(Line &line, uint32_t milliseconds) {
     if (milliseconds == UINT32_MAX) line.append("--");
     else line.append("%lums", static_cast<unsigned long>(milliseconds));
 }
+void pdrChannel(Line &line, const char *name, const pdr::ChannelDiagnostics &d) {
+    line.append(" | %scand:",name); line.value(d.candidate);
+    line.append(" %sQ:",name); line.value(d.quality,"",2);
+    line.append(" %sMod:",name); line.value(100*d.modulation,"%",3);
+    line.append(" %sWhy:%s",name,pdr::channelStatusName(d.status));
+}
 const char *protocolAction(const Snapshot &s, bool p1) {
     const auto playback = p1 ? s.p1Playback : s.p2Playback;
     if (s.hapticFault) return "MOTOR_FAULT";
@@ -94,13 +100,22 @@ bool formatLine(Group group, const Snapshot &s, char *output, size_t capacity) {
         break;
     case Group::PDR: {
         const auto &p = s.respiration;
-        line.append("Rate:"); line.value(p.valid ? p.rate : NAN,"br/min");
-        line.append(" | Q:%.0f | Status:%s | Src:%s | Rest:",p.quality,pdr::statusName(p.status),
-            p.sources == 3 ? "RIAV+RIFV" : p.sources == 1 ? "RIAV" : p.sources == 2 ? "RIFV" : "--");
-        line.value(p.baselineReady ? p.baseline : NAN,"br/min");
-        line.append(" | RestValid:%lu/180s | Dev:",(unsigned long)(p.baselineValidMs/1000));
-        line.value(p.valid && p.baselineReady ? p.deviation : NAN,"%");
-        line.append(" | Support:%s | Hold:%lu/20s",yn(p.support),(unsigned long)(p.supportMs/1000));
+        line.append("Rate:"); line.value(p.valid ? p.rate : NAN," brpm");
+        line.append(" | Q:"); line.value(p.valid ? p.quality : NAN,"",2);
+        line.append(" | RIAV:"); line.value(p.riav);
+        line.append(" | RIFV:"); line.value(p.rifv);
+        line.append(" | %s",p.valid ? "VALID" : "INVALID");
+        if (!p.valid) line.append(" | Reason:%s",pdr::statusName(p.status));
+        pdrChannel(line,"AV",p.av);
+        pdrChannel(line,"FV",p.fv);
+        line.append(" | Win:%.1f/45s | Cover:",p.windowMs/1000.0f);
+        line.value(100*p.coverage,"%",1);
+        line.append(" | BeatAge:"); age(line,p.beatAgeMs);
+        line.append(" | BeatGap:%lums",(unsigned long)p.lastBeatGapMs);
+        line.append(" | Resets:%lu | LastReset:%s",(unsigned long)p.resets,
+                    pdr::resetReasonName(p.lastReset));
+        if (p.lastReset != pdr::ResetReason::NONE)
+            line.append("@%lums Gap:%lums",(unsigned long)p.resetTime,(unsigned long)p.resetGapMs);
         break;
     }
     case Group::P1:
@@ -115,7 +130,6 @@ bool formatLine(Group group, const Snapshot &s, char *output, size_t capacity) {
             rmssd::sourceName(p1 ? s.p1Source : s.p2Source));
         line.append(" | Playback:%s | Action:%s",
             haptics::playbackName(p1 ? s.p1Playback : s.p2Playback),protocolAction(s,p1));
-        if (!p1) line.append(" | RateMatch:%s",pdr::syncName(s.respiration.sync));
         break;
     }
     case Group::SESSION:

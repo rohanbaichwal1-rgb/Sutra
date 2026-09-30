@@ -35,7 +35,7 @@
 // BLE switch: 1 = ON, 0 = OFF. Rebuild and upload after changing.
 // Serial reporting, sensing, and haptics remain enabled in either mode.
 #ifndef SUTRA_BLE_ENABLED
-#define SUTRA_BLE_ENABLED 0
+#define SUTRA_BLE_ENABLED 1
 #endif
 #if SUTRA_BLE_ENABLED != 0 && SUTRA_BLE_ENABLED != 1
 #error "SUTRA_BLE_ENABLED must be 0 or 1"
@@ -54,6 +54,7 @@
 #include "NvsBaselineStore.h"
 #include "BleTelemetry.h"
 #include "PdrService.h"
+#include <PdrPulseAmplitude.h>
 #include <esp_system.h>
 
 rmssd::Monitor referenceMonitor;
@@ -329,6 +330,7 @@ bool lmsHaveRunningPeakAmplitude = false;
 
 uint32_t lastCleanedBeatMs = 0;
 beats::Recovery lmsRecovery;
+pdr::PulseAmplitude pdrPulseAmplitude;
 static_assert(STALE_RESEED_MS == beats::Recovery::STALE_MS, "Keep freshness timeouts aligned");
 
 // Local-peak history used by the Elgendi detector.
@@ -565,6 +567,7 @@ void resetElgendiState()
 
     lastCleanedBeatMs = 0;
     lmsRecovery.reset();
+    pdrPulseAmplitude.reset();
 
     latestCleanedIBI = 0;
     newCleanedIBIAvailable = false;
@@ -672,6 +675,14 @@ void detectBeatOnCleanedSignal(float cleanedValue)
 
     uint32_t now = millis();
     bool aboveThreshold = (maPeak > thr1);
+    // PDR-only pulse height. Keep the existing detector, beat timestamps,
+    // acceptance decisions and RMSSD input completely unchanged.
+    const float pdrSample = constrain(
+    -cleanedValue,
+    -MAX_PLAUSIBLE_CLEANED,
+    MAX_PLAUSIBLE_CLEANED
+);
+pdrPulseAmplitude.observe(pdrSample, now, aboveThreshold);
 
     // FIX: collect one strongest crest per Elgendi supra-threshold
     // pulse region. The previous implementation accepted every local
@@ -820,10 +831,21 @@ void detectBeatOnCleanedSignal(float cleanedValue)
                             newCleanedIBIAvailable = true;
                             lastCleanedBeatMs = peakMs;
 
-                            if (addIbiToRmssdBuffer(
-                                    latestCleanedIBI,
-                                    peakMs))
-                                pdrService::beat(peakMs, peakAmplitude, latestCleanedIBI);
+                            addIbiToRmssdBuffer(latestCleanedIBI, peakMs);
+                            // Passive copy of accepted, directly observed PPG beats.
+                            // RMSSD's separate artifact decision is unchanged.
+                            const float pdrAmp = pdrPulseAmplitude.amplitude();
+
+                            static unsigned pdrAmpPrintCount = 0;
+                            if (++pdrAmpPrintCount >= 10) {
+                                pdrAmpPrintCount = 0;
+                                Serial.print("[PDR AMP] trough-to-crest=");
+                                Serial.print(pdrAmp);
+                                Serial.print(" detector-crest=");
+                                Serial.println(peakAmplitude);
+}
+
+pdrService::beat(peakMs, pdrAmp, latestCleanedIBI);
 
                             lmsRecovery.accept(peakMs);
                             acceptedPeak = true;
@@ -1793,7 +1815,7 @@ haptics::ArrayConfig singleMotorHapticConfig()
     haptics::ArrayConfig config;
     config.motorCount = 1;
     config.channels[0] = 0;
-    config.outputScalePercent = 40; // Map the original 0..100% envelope to 0..40%.
+    config.outputScalePercent = 20; // Map the original 0..100% envelope to 0..40%.
     return config;
 }
 haptics::ArrayConfig threeMotorBootCheckConfig()
@@ -1803,7 +1825,7 @@ haptics::ArrayConfig threeMotorBootCheckConfig()
     config.channels[0] = 0;
     config.channels[1] = 1;
     config.channels[2] = 2;
-    config.outputScalePercent = 40;
+    config.outputScalePercent = 20;
     return config;
 }
 haptics::ArrayConfig hapticArrayConfig = singleMotorHapticConfig();
@@ -1867,11 +1889,8 @@ void reportHapticFault()
 
 void updateHapticActuator(uint32_t nowMs)
 {
-    const bool wasP2 = hapticPatterns.protocol() == haptics::Protocol::P2_SWEEP;
     if (!hapticArray.ready())
     {
-        if (wasP2)
-            pdrService::endP2(nowMs, false);
         hapticPatterns.stop();
         if (hapticArray.shutdownPending() &&
             nowMs - lastHapticStopRetryMs >= HAPTIC_STOP_RETRY_MS)
@@ -1889,7 +1908,6 @@ void updateHapticActuator(uint32_t nowMs)
     lastHapticFrameMs = nowMs;
 
     const haptics::Frame &frame = hapticPatterns.update(nowMs);
-    const bool naturallyCompleted = !hapticPatterns.active();
     if (!hapticPatterns.active())
     {
         if (hapticArray.stopAll())
@@ -1905,8 +1923,6 @@ void updateHapticActuator(uint32_t nowMs)
             hapticPatterns.stop();
     }
     hapticPatternActive = hapticPatterns.active() || hapticArray.outputStopPending();
-    if (wasP2 && !hapticPatterns.active())
-        pdrService::endP2(nowMs, naturallyCompleted && hapticArray.ready() && !hapticArray.outputStopPending());
     reportHapticFault();
 }
 
@@ -1923,8 +1939,6 @@ void startHapticProtocol(haptics::Protocol protocol, uint32_t nowMs)
 
     if (!hapticArray.pollFaults() || !hapticArray.stopAll())
     {
-        if (hapticPatterns.protocol() == haptics::Protocol::P2_SWEEP)
-            pdrService::endP2(nowMs, false);
         hapticPatterns.stop();
         hapticPatternActive = hapticArray.outputStopPending();
         reportHapticFault();
@@ -1941,8 +1955,6 @@ void startHapticProtocol(haptics::Protocol protocol, uint32_t nowMs)
     hapticPatternActive = hapticPatterns.active() || hapticArray.outputStopPending();
     if (hapticPatterns.active())
     {
-        if (protocol == haptics::Protocol::P2_SWEEP)
-            pdrService::beginP2(nowMs);
         Serial.print("[HAPTIC] started ");
         Serial.print(getHapticStateName());
         Serial.print(" | Duration:");
@@ -2022,7 +2034,6 @@ void updateStressTriggers(uint32_t nowMs)
         sessionCollector.complete(),
         sessionCollector.median()};
     rmssd::Events events = referenceMonitor.update(input);
-    const pdr::Result pdrContext = pdrService::read(nowMs);
 
     if (events.resumed)
         Serial.println("[P1/P2] recovery complete - triggers rearmed");
@@ -2031,15 +2042,13 @@ void updateStressTriggers(uint32_t nowMs)
     {
         Serial.print("[P1] TRIGGERED | TriggerSource:");
         Serial.print(rmssd::sourceName(events.p1));
-        Serial.print(" | LongTermBasis:SEVEN_SESSIONS | PDR_SUPPORT:");
-        Serial.println(pdrContext.support ? "Y" : "N");
+        Serial.println(" | LongTermBasis:SEVEN_SESSIONS");
     }
     if (events.p2 != rmssd::Source::NONE)
     {
         Serial.print("[P2] TRIGGERED | TriggerSource:");
         Serial.print(rmssd::sourceName(events.p2));
-        Serial.print(" | LongTermBasis:SEVEN_SESSIONS | PDR_SUPPORT:");
-        Serial.println(pdrContext.support ? "Y" : "N");
+        Serial.println(" | LongTermBasis:SEVEN_SESSIONS");
         startHapticProtocol(haptics::Protocol::P2_SWEEP, nowMs);
     }
     else if (events.p1 != rmssd::Source::NONE)
@@ -2374,11 +2383,8 @@ void loop()
     }
 
     // Independent observer. Its output is never passed to the RMSSD monitor.
-    pdrService::context(nowMs, {isReferenceInputFresh(nowMs) && latestAccelOK && latestGyroOK,
-                                motionState == MOTION_LOW,
-                                !referenceMonitor.postExerciseRecovery(),
-                                isLmsConvergedGate() && !referenceMonitor.p1Triggered() && !referenceMonitor.p2Triggered(),
-                                hapticPatternActive});
+    pdrService::context(nowMs, {fingerPresent&& latestAccelOK && latestGyroOK,
+                                motionState == MOTION_LOW});
 
     if (nowMs - rateWindowStartMs >= 1000)
     {
@@ -2437,11 +2443,6 @@ void loop()
         snapshot.p2Triggered = referenceMonitor.p2Triggered();
         snapshot.episode = snapshot.p2Triggered ? 2 : snapshot.p1Triggered ? 1 : 0;
         snapshot.respiration = pdrService::read(nowMs);
-        if (hapticPatternActive)
-        {
-            snapshot.respiration.support = false;
-            snapshot.respiration.supportMs = 0;
-        }
         snapshot.normalHr = normalValid ? currentBPM : NAN;
         snapshot.normalIbi = normalValid && currentIBI > 0 ? currentIBI : NAN;
         snapshot.imuOK = latestAccelOK && latestGyroOK;

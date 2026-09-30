@@ -49,18 +49,41 @@ void test_missing_readings_do_not_look_like_zero() {
 
 void test_signed_deviations_and_separate_protocol_timers() {
     auto s = sample();
-    s.respiration.valid = s.respiration.baselineReady = true;
-    s.respiration.deviation = -25;
     s.p1Ms[0] = 30000; s.p2Ms[1] = 95000;
     char line[telemetry::LINE_CAPACITY];
-    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::PDR,s,line,sizeof(line)));
-    TEST_ASSERT_NOT_NULL(strstr(line,"Dev:-25.0%"));
     TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::SESSION,s,line,sizeof(line)));
     TEST_ASSERT_NOT_NULL(strstr(line,"Dev:20.0%"));
     TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::P1,s,line,sizeof(line)));
     TEST_ASSERT_NOT_NULL(strstr(line,"Session:30/30s | Short:0/30s"));
     TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::P2,s,line,sizeof(line)));
     TEST_ASSERT_NOT_NULL(strstr(line,"Session:0/120s | Short:95/120s"));
+    s.rmssd = 125;
+    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::SESSION,s,line,sizeof(line)));
+    TEST_ASSERT_NOT_NULL(strstr(line,"Dev:-25.0%"));
+}
+
+void test_passive_pdr_output_and_protocol_independence() {
+    auto s = sample();
+    char before[telemetry::LINE_CAPACITY], after[telemetry::LINE_CAPACITY];
+    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::PDR,s,before,sizeof(before)));
+    TEST_ASSERT_NOT_NULL(strstr(before,"Rate:-- | Q:-- | RIAV:-- | RIFV:-- | INVALID | Reason:WARMUP"));
+    for (auto group : {telemetry::Group::P1,telemetry::Group::P2,telemetry::Group::SESSION}) {
+        s.respiration = pdr::Result{};
+        TEST_ASSERT_TRUE(telemetry::formatLine(group,s,before,sizeof(before)));
+        s.respiration.valid = true;
+        s.respiration.rate = 14.2f; s.respiration.quality = 0.82f;
+        s.respiration.riav = 14; s.respiration.rifv = 14.5f;
+        s.respiration.status = pdr::Status::VALID;
+        TEST_ASSERT_TRUE(telemetry::formatLine(group,s,after,sizeof(after)));
+        TEST_ASSERT_EQUAL_STRING(before,after);
+    }
+    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::PDR,s,after,sizeof(after)));
+    TEST_ASSERT_NOT_NULL(strstr(after,"Rate:14.2 brpm | Q:0.82 | RIAV:14.0 | RIFV:14.5 | VALID"));
+    s.respiration.valid = false;
+    s.respiration.status = pdr::Status::DISAGREE;
+    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::PDR,s,after,sizeof(after)));
+    TEST_ASSERT_NOT_NULL(strstr(after,"Rate:--"));
+    TEST_ASSERT_NOT_NULL(strstr(after,"INVALID | Reason:DISAGREE"));
 }
 
 void test_small_buffer_is_cleared_without_overrun() {
@@ -143,8 +166,35 @@ void test_boot_failure_is_reported_after_startup() {
     TEST_ASSERT_NOT_NULL(strstr(line,"BootTest:FAILED | FaultBits:0x02"));
 }
 
+void test_pdr_diagnostics_fit_and_do_not_publish_rejected_candidates() {
+    auto s = sample();
+    s.uptimeSeconds = UINT32_MAX;
+    auto &p = s.respiration;
+    p.status = pdr::Status::WEAK;
+    p.quality = 0.99f; // Invalid fusion must not present this as a usable score.
+    p.av.candidate = 14; p.av.quality = 0.42f; p.av.modulation = 0.024f;
+    p.av.status = pdr::ChannelStatus::LOW_PERIODICITY;
+    p.fv.candidate = 15; p.fv.quality = 0.96f; p.fv.modulation = 0.001f;
+    p.fv.status = pdr::ChannelStatus::LOW_MODULATION;
+    p.coverage = 0.95f; p.windowMs = pdr::WINDOW_MS; p.beatAgeMs = UINT32_MAX-1;
+    p.resets = p.resetTime = p.resetGapMs = UINT32_MAX;
+    p.lastBeatGapMs = UINT32_MAX;
+    p.lastReset = pdr::ResetReason::QUEUE_OVERFLOW;
+    char line[telemetry::LINE_CAPACITY];
+    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::PDR,s,line,sizeof(line)));
+    TEST_ASSERT_NOT_NULL(strstr(line,"Rate:-- | Q:-- | RIAV:-- | RIFV:--"));
+    TEST_ASSERT_NOT_NULL(strstr(line,"AVcand:14.0 AVQ:0.42 AVMod:2.400% AVWhy:LOW_Q"));
+    TEST_ASSERT_NOT_NULL(strstr(line,"FVcand:15.0 FVQ:0.96 FVMod:0.100% FVWhy:LOW_MOD"));
+    TEST_ASSERT_NOT_NULL(strstr(line,"Win:45.0/45s | Cover:95.0%"));
+    TEST_ASSERT_NOT_NULL(strstr(line,"BeatGap:4294967295ms"));
+    TEST_ASSERT_NOT_NULL(strstr(line,"LastReset:QUEUE_OVERFLOW@4294967295ms Gap:4294967295ms"));
+    TEST_ASSERT_EQUAL_CHAR('\n',line[strlen(line)-1]);
+}
+
 int main() {
     UNITY_BEGIN();
+    RUN_TEST(test_pdr_diagnostics_fit_and_do_not_publish_rejected_candidates);
+    RUN_TEST(test_passive_pdr_output_and_protocol_independence);
     RUN_TEST(test_triggered_is_distinct_from_playback_and_recovery);
     RUN_TEST(test_diagnostic_ages_and_large_counters_fit_without_truncation);
     RUN_TEST(test_boot_failure_is_reported_after_startup);

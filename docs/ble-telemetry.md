@@ -37,9 +37,9 @@ Their UUIDs share the service suffix; the first eight digits identify the group:
 |---|---|---|
 | `7d2a0101` | Normal | Reference detector HR/IBI, finger, motion, IMU |
 | `7d2a0102` | LMS | LMS HR/median IBI, RMSSD, convergence, stability, freshness |
-| `7d2a0103` | PDR | Respiratory rate, quality, status, sources, resting baseline, deviation, support timer |
+| `7d2a0103` | PDR | Respiratory rate, quality (0-1), RIAV/RIFV rates, validity and unavailable reason |
 | `7d2a0104` | P1 | Session/short/seven-session timers, triggered flag, source |
-| `7d2a0105` | P2 | Session/short/seven-session timers, triggered flag, source, respiratory rate match |
+| `7d2a0105` | P2 | Session/short/seven-session timers, triggered flag, source |
 | `7d2a0106` | SessionBaseline | Frozen RMSSD, deviation, current session time/sample progress, storage status |
 | `7d2a0107` | Short | Adapting RMSSD, deviation, qualifying time, block progress, breaks, collection gate |
 | `7d2a0108` | PersonalBaseline | Seven-session RMSSD, saved session count, deviation |
@@ -66,9 +66,9 @@ Example (illustrative values):
 ```
 
 `--` means unavailable; booleans are Y/N. RMSSD deviation is positive for a drop;
-PDR deviation is signed relative to the resting respiratory rate. `Normal` uses
+PDR is unavailable unless both RIAV and RIFV pass quality and agree. `Normal` uses
 the existing non-LMS reference beat detector; it is separate from the LMS values
-used by the RMSSD logic. PDR remains context only and never gates P1/P2; see
+used by the RMSSD logic. PDR is display-only with no P1/P2 connections; see
 [pdr-observer.md](pdr-observer.md).
 
 Snapshots are produced about once per second, not as a lossless sample/beat log.
