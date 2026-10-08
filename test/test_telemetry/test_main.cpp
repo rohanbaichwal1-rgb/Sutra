@@ -47,16 +47,14 @@ void test_missing_readings_do_not_look_like_zero() {
     TEST_ASSERT_NOT_NULL(strstr(line,"Session:0/30s | Short:0/30s | 7Session:--"));
 }
 
-void test_signed_deviations_and_separate_protocol_timers() {
+void test_signed_deviations_and_p1_timer() {
     auto s = sample();
-    s.p1Ms[0] = 30000; s.p2Ms[1] = 95000;
+    s.p1Ms[0] = 30000;
     char line[telemetry::LINE_CAPACITY];
     TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::SESSION,s,line,sizeof(line)));
     TEST_ASSERT_NOT_NULL(strstr(line,"Dev:20.0%"));
     TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::P1,s,line,sizeof(line)));
     TEST_ASSERT_NOT_NULL(strstr(line,"Session:30/30s | Short:0/30s"));
-    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::P2,s,line,sizeof(line)));
-    TEST_ASSERT_NOT_NULL(strstr(line,"Session:0/120s | Short:95/120s"));
     s.rmssd = 125;
     TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::SESSION,s,line,sizeof(line)));
     TEST_ASSERT_NOT_NULL(strstr(line,"Dev:-25.0%"));
@@ -67,7 +65,7 @@ void test_passive_pdr_output_and_protocol_independence() {
     char before[telemetry::LINE_CAPACITY], after[telemetry::LINE_CAPACITY];
     TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::PDR,s,before,sizeof(before)));
     TEST_ASSERT_NOT_NULL(strstr(before,"Rate:-- | Q:-- | RIAV:-- | RIFV:-- | INVALID | Reason:WARMUP"));
-    for (auto group : {telemetry::Group::P1,telemetry::Group::P2,telemetry::Group::SESSION}) {
+    for (auto group : {telemetry::Group::P1,telemetry::Group::SESSION}) {
         s.respiration = pdr::Result{};
         TEST_ASSERT_TRUE(telemetry::formatLine(group,s,before,sizeof(before)));
         s.respiration.valid = true;
@@ -135,11 +133,15 @@ void test_triggered_is_distinct_from_playback_and_recovery() {
     TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::P1,s,line,sizeof(line)));
     TEST_ASSERT_NOT_NULL(strstr(line,"Playback:COMPLETED | Action:WAIT_RECOVERY"));
     s.p1Triggered = false;
-    s.p2Playback = haptics::Playback::STARTED;
+    s.followUp = rmssd::FollowUp::ISSUED;
+    s.followUpPlayback = haptics::Playback::STARTED;
     TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::P1,s,line,sizeof(line)));
-    TEST_ASSERT_NOT_NULL(strstr(line,"Action:P2_PRIORITY"));
-    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::P2,s,line,sizeof(line)));
-    TEST_ASSERT_NOT_NULL(strstr(line,"Playback:STARTED | Action:PLAYING"));
+    TEST_ASSERT_NOT_NULL(strstr(line,"Action:FOLLOW_UP_PLAYING"));
+    TEST_ASSERT_NOT_NULL(strstr(line,"FollowUp:ISSUED | FollowUpPlayback:STARTED"));
+    s.followUp = rmssd::FollowUp::CANCELLED;
+    s.followUpPlayback = haptics::Playback::NOT_STARTED;
+    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::P1,s,line,sizeof(line)));
+    TEST_ASSERT_NOT_NULL(strstr(line,"FollowUp:CANCELLED"));
 }
 
 void test_diagnostic_ages_and_large_counters_fit_without_truncation() {
@@ -191,8 +193,28 @@ void test_pdr_diagnostics_fit_and_do_not_publish_rejected_candidates() {
     TEST_ASSERT_EQUAL_CHAR('\n',line[strlen(line)-1]);
 }
 
+void test_trigger_counts_are_independent_of_latches_and_playback() {
+    auto s=sample();
+    char line[telemetry::LINE_CAPACITY];
+    for (auto group : {telemetry::Group::P1}) {
+        TEST_ASSERT_TRUE(telemetry::formatLine(group,s,line,sizeof(line)));
+        TEST_ASSERT_NOT_NULL(strstr(line,"TriggerCount:0\n"));
+    }
+    s.p1TriggerCount=3;
+    s.p1Triggered=true; s.hapticFault=true;
+    s.p1Playback=haptics::Playback::FAILED;
+    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::P1,s,line,sizeof(line)));
+    TEST_ASSERT_NOT_NULL(strstr(line,"TriggerCount:3\n"));
+    s.p1Triggered=false; s.hapticFault=false; // Recovery does not hide/reset totals.
+    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::P1,s,line,sizeof(line)));
+    TEST_ASSERT_NOT_NULL(strstr(line,"TriggerCount:3\n"));
+    s.p1TriggerCount=UINT32_MAX;
+    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::P1,s,line,sizeof(line)));
+    TEST_ASSERT_NOT_NULL(strstr(line,"TriggerCount:4294967295\n"));
+}
 int main() {
     UNITY_BEGIN();
+    RUN_TEST(test_trigger_counts_are_independent_of_latches_and_playback);
     RUN_TEST(test_pdr_diagnostics_fit_and_do_not_publish_rejected_candidates);
     RUN_TEST(test_passive_pdr_output_and_protocol_independence);
     RUN_TEST(test_triggered_is_distinct_from_playback_and_recovery);
@@ -200,7 +222,7 @@ int main() {
     RUN_TEST(test_boot_failure_is_reported_after_startup);
     RUN_TEST(test_each_group_is_one_complete_bounded_line);
     RUN_TEST(test_missing_readings_do_not_look_like_zero);
-    RUN_TEST(test_signed_deviations_and_separate_protocol_timers);
+    RUN_TEST(test_signed_deviations_and_p1_timer);
     RUN_TEST(test_small_buffer_is_cleared_without_overrun);
     RUN_TEST(test_mtu_fragmentation_preserves_all_lines_and_delimiters);
     return UNITY_END();

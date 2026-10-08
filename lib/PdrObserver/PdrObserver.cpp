@@ -121,6 +121,7 @@ const char *statusName(Status s) {
     case Status::WEAK: return "WEAK";
     case Status::DISAGREE: return "DISAGREE";
     case Status::VALID: return "VALID";
+    case Status::HELD: return "HELD";
     default: return "STALE";
     }
 }
@@ -150,7 +151,7 @@ const char *resetReasonName(ResetReason r) {
 void Observer::invalidate(Status reason) {
     result_.valid = false;
     result_.rate = result_.riav = result_.rifv = NAN;
-    result_.quality = result_.coverage = NAN;
+    result_.quality = NAN;
     result_.av = result_.fv = ChannelDiagnostics{};
     result_.status = reason;
 }
@@ -169,6 +170,8 @@ void Observer::clearHistory(Status reason, ResetReason detail, uint32_t now, uin
 stableRate_ = NAN;
 stableQuality_ = NAN;
 lastValidRateMs_ = 0;
+pendingRate_ = NAN;
+pendingRateCount_ = 0;
 
 // Integrity/contact resets discard samples, never restart the boot's clock.
 breakPending_ = skipNextBeat_ = true;
@@ -184,8 +187,11 @@ void Observer::dataLost(uint32_t now, ResetReason reason) {
 }
 void Observer::addBeat(uint32_t time, float amplitude, float ibi) {
     if (!acceptingBeats_) return;
-    if (!isfinite(amplitude) || amplitude <= 0 || !isfinite(ibi) || ibi < 300 || ibi > 1800)
-        return;
+if (!isfinite(ibi) || ibi < 300 || ibi > 1800)
+    return;
+
+const bool amplitudeValid =
+    isfinite(amplitude) && amplitude > 0.0f;
     // The first returning IBI may span the bad interval; do not use it.
     if (skipNextBeat_) { skipNextBeat_ = false; return; }
     if (count_) {
@@ -193,17 +199,25 @@ void Observer::addBeat(uint32_t time, float amplitude, float ibi) {
         if (!delta || delta > 0x7fffffffUL) {
             clearHistory(Status::GAP, ResetReason::TIMESTAMP, time, delta); return;
         }
-        if (delta > MAX_GAP_MS) {
-            // A known beat gap is missing data, not loss of the entire window.
-            // estimate() already excludes this interval from interpolation and
-            // requires MIN_COVERAGE. Never carry a valid result across the gap.
-            result_.lastBeatGapMs = delta;
-            invalidate(Status::GAP);
-        }
+        if (delta > MAX_GAP_MS)
+{
+    result_.lastBeatGapMs = delta;
+
+    // Keep previous history, but never interpolate
+    // across the missing-beat interval.
+    breakPending_ = true;
+
+    invalidate(Status::GAP);
+}
     }
     if (!windowStarted_) { windowStarted_ = true; windowStart_ = time; }
-    beats_[head_] = {time, amplitude, ibi, !breakPending_};
-    breakPending_ = false;
+beats_[head_] = {
+    time,
+    amplitudeValid ? amplitude : NAN,
+    ibi,
+    !breakPending_,
+    amplitudeValid
+};    breakPending_ = false;
     head_ = (head_ + 1) % BEAT_CAPACITY;
     if (count_ < BEAT_CAPACITY) ++count_;
 }
@@ -216,12 +230,11 @@ bool Observer::estimate(uint32_t now) {
     result_.riav = NAN;
     result_.rifv = NAN;
     result_.quality = NAN;
-    result_.coverage = NAN;
     result_.av = ChannelDiagnostics{};
     result_.fv = ChannelDiagnostics{};
     result_.status = Status::WARMUP;
     constexpr uint32_t window = WINDOW_MS;
-    if (!windowStarted_ || result_.windowMs < window) return false;
+    if (!windowStarted_ || !initialWarmupComplete_) return false;
     if (count_ < 2) { result_.status = Status::GAP; result_.coverage = 0; return false; }
     const unsigned oldest = (head_ + BEAT_CAPACITY - count_) % BEAT_CAPACITY;
     const Beat &last = beats_[(head_ + BEAT_CAPACITY - 1) % BEAT_CAPACITY];
@@ -244,6 +257,11 @@ bool Observer::estimate(uint32_t now) {
             if (j+1>=count_) continue;
             const Beat &a=beats_[(oldest+j)%BEAT_CAPACITY], &b=beats_[(oldest+j+1)%BEAT_CAPACITY];
             if (!b.continuous) continue; // Never interpolate across a known pause.
+            if (channel == 0 &&
+            (!a.amplitudeValid || !b.amplitudeValid))
+        {
+            continue;
+        }
             const uint32_t beatGap=b.time-a.time;
             if (!beatGap || beatGap>MAX_GAP_MS || beatGap>1.8f*fmaxf(a.ibi,b.ibi)) continue;
             const uint32_t aTime=featureTime(a), bTime=featureTime(b);
@@ -252,22 +270,58 @@ bool Observer::estimate(uint32_t now) {
             const uint32_t aAge=now-aTime;
             if (aAge<age || aAge-age>gap) continue; // no extrapolation or unsigned underflow
             const float fraction=(float)(aAge-age)/gap;
-            if (channel) ibiGrid_[i]=a.ibi+fraction*(b.ibi-a.ibi);
-            else {
-                amplitudeGrid_[i]=a.amplitude+fraction*(b.amplitude-a.amplitude);
-                sumIbi += a.ibi+fraction*(b.ibi-a.ibi);
+            if (channel) {
+                ibiGrid_[i] = a.ibi + fraction * (b.ibi - a.ibi);
+
+                // Mean IBI is derived from the valid RIFV channel.
+                sumIbi += ibiGrid_[i];
             }
+            else {
+                amplitudeGrid_[i] =
+                    a.amplitude + fraction * (b.amplitude - a.amplitude);
+}
             valid=true; ++coverage[channel];
         }
     }
-    const unsigned covered=coverage[0]<coverage[1] ? coverage[0] : coverage[1];
-    result_.coverage=(float)covered/n;
-    if (covered<n*MIN_COVERAGE) { result_.status=Status::GAP; return false; }
-    // Include guard frequencies up to the conservative beat Nyquist limit.
-    const float maxRate=fminf(60,0.45f*60000/(sumIbi/coverage[0]));
-    const Channel av=fit(amplitudeGrid_,gridValid_,n,maxRate,RIAV_MIN_STD);
-    const Channel fv=fit(ibiGrid_,fvGridValid_,n,maxRate,RIFV_MIN_STD);
-    // ---------------------------------------------------------
+// Independent channel coverage.
+result_.coverageAV = (float)coverage[0] / (float)n;
+result_.coverageFV = (float)coverage[1] / (float)n;
+
+// BRPM is RIFV-only. Keep per-channel coverage independent and report the
+// coverage of the channel that actually gates and produces BRPM.
+result_.coverage = result_.coverageFV;
+
+// Each respiratory channel qualifies independently.
+const bool avCoverageOK =
+    result_.coverageAV >= MIN_COVERAGE;
+
+const bool fvCoverageOK =
+    result_.coverageFV >= MIN_COVERAGE;
+
+if (!avCoverageOK && !fvCoverageOK) {
+    result_.status = Status::GAP;
+    return false;
+}
+
+// Mean IBI must be available from the RIFV channel.
+if (coverage[1] == 0 || !isfinite(sumIbi) || sumIbi <= 0.0f) {
+    result_.status = Status::GAP;
+    return false;
+}
+
+const float meanIbi = sumIbi / (float)coverage[1];
+
+const float maxRate =
+    fminf(60.0f, 0.45f * 60000.0f / meanIbi);
+
+// Default Channel{} is unusable in the latest implementation.
+const Channel av = avCoverageOK
+    ? fit(amplitudeGrid_, gridValid_, n, maxRate, RIAV_MIN_STD)
+    : Channel{};
+
+const Channel fv = fvCoverageOK
+    ? fit(ibiGrid_, fvGridValid_, n, maxRate, RIFV_MIN_STD)
+    : Channel{};    // ---------------------------------------------------------
 // Save current RIAV / RIFV diagnostics
 // ---------------------------------------------------------
 
@@ -275,55 +329,20 @@ result_.status = Status::WEAK;
 
 result_.av = av.diagnostics();
 result_.fv = fv.diagnostics();
-
 result_.riav = av.usable ? av.rate : NAN;
 result_.rifv = fv.usable ? fv.rate : NAN;
 
 
 // ---------------------------------------------------------
-// Calculate RAW PDR from RIAV / RIFV
+// Calculate RAW PDR from RIFV only. RIAV remains diagnostic-only.
 // ---------------------------------------------------------
 
 float rawRate = NAN;
 float rawQuality = NAN;
 
-if (av.usable && fv.usable)
+if (fv.usable)
 {
-    // Both channels are usable.
-    // Only combine them when they agree.
-    if (fabsf(av.rate - fv.rate) <= MAX_DISAGREEMENT)
-    {
-        const float totalQuality =
-            av.quality + fv.quality;
-
-        if (totalQuality > 0.0f)
-        {
-            rawRate =
-                (av.rate * av.quality +
-                 fv.rate * fv.quality)
-                / totalQuality;
-
-            rawQuality =
-                0.5f *
-                (av.quality + fv.quality);
-        }
-    }
-    else
-    {
-        // Both channels are individually usable,
-        // but they disagree with each other.
-        result_.status = Status::DISAGREE;
-    }
-}
-else if (av.usable)
-{
-    // RIAV alone is usable.
-    rawRate = av.rate;
-    rawQuality = av.quality;
-}
-else if (fv.usable)
-{
-    // RIFV alone is usable.
+    // BRPM input is RIFV only; RIAV does not gate, fuse, or override it.
     rawRate = fv.rate;
     rawQuality = fv.quality;
 }
@@ -333,19 +352,55 @@ else if (fv.usable)
 // NEW VALID PDR FOUND
 // ---------------------------------------------------------
 
+
+if (isfinite(rawRate))
+{
+    // Confirm sudden changes before updating stable BRPM.
+    if (isfinite(stableRate_) &&
+        fabsf(rawRate - stableRate_) > MAX_RATE_JUMP)
+    {
+        if (isfinite(pendingRate_) &&
+            fabsf(rawRate - pendingRate_) <=
+                JUMP_CONFIRM_TOLERANCE)
+        {
+            if (pendingRateCount_ < JUMP_CONFIRM_COUNT)
+                ++pendingRateCount_;
+        }
+        else
+        {
+            pendingRate_ = rawRate;
+            pendingRateCount_ = 1;
+        }
+
+        if (pendingRateCount_ < JUMP_CONFIRM_COUNT)
+        {
+            // Reject this candidate for now.
+            // Preserve stableRate_ and allow the
+            // existing HELD logic below to run.
+            rawRate = NAN;
+        }
+        else
+        {
+            pendingRate_ = NAN;
+            pendingRateCount_ = 0;
+        }
+    }
+    else
+    {
+        pendingRate_ = NAN;
+        pendingRateCount_ = 0;
+    }
+}
+
+// Only update smoothing with a confirmed, finite rate.
 if (isfinite(rawRate))
 {
     if (!isfinite(stableRate_))
     {
-        // First valid PDR value.
         stableRate_ = rawRate;
     }
     else
     {
-        // Smooth the new PDR.
-        //
-        // 75% previous value
-        // 25% new value
         stableRate_ =
             ((1.0f - PDR_SMOOTH_ALPHA) * stableRate_) +
             (PDR_SMOOTH_ALPHA * rawRate);
@@ -356,12 +411,12 @@ if (isfinite(rawRate))
 
     result_.rate = stableRate_;
     result_.quality = stableQuality_;
-
     result_.valid = true;
     result_.status = Status::VALID;
 
     return true;
 }
+
 
 
 // ---------------------------------------------------------
@@ -378,8 +433,9 @@ if (isfinite(stableRate_) &&
     result_.rate = stableRate_;
     result_.quality = stableQuality_;
 
+    // Value is retained, not newly calculated.
     result_.valid = true;
-    result_.status = Status::VALID;
+    result_.status = Status::HELD;
 
     return true;
 }
@@ -393,6 +449,8 @@ stableRate_ = NAN;
 stableQuality_ = NAN;
 lastValidRateMs_ = 0;
 
+pendingRate_ = NAN;
+pendingRateCount_ = 0;
 result_.rate = NAN;
 result_.quality = NAN;
 result_.valid = false;
@@ -402,10 +460,19 @@ return false;
 }
 void Observer::update(uint32_t now, const Context &context) {
     result_.time = now;
-    // Warm up once from the first usable beat, saturating even across millis wrap.
-    if (windowStarted_ && result_.windowMs < WINDOW_MS) {
+    bool initialWarmupJustCompleted = false;
+    // Warm up once from the first usable beat, saturating even across millis
+    // wrap. The first published result is gated for 150 seconds; thereafter
+    // result_.windowMs reports the unchanged rolling 45-second estimator.
+    if (windowStarted_ && !initialWarmupComplete_) {
         const uint32_t elapsed = now-windowStart_;
-        result_.windowMs = elapsed < WINDOW_MS ? elapsed : WINDOW_MS;
+        if (elapsed < INITIAL_WARMUP_MS)
+            result_.windowMs = elapsed;
+        else {
+            initialWarmupComplete_ = true;
+            result_.windowMs = WINDOW_MS;
+            initialWarmupJustCompleted = true;
+        }
     }
     if (haveUpdate_ && now-lastUpdate_ > MAX_GAP_MS)
         clearHistory(Status::GAP, ResetReason::CONTEXT_GAP, now, now-lastUpdate_);
@@ -414,7 +481,7 @@ void Observer::update(uint32_t now, const Context &context) {
             // A beat event can arrive just before its bad-context notification.
             // Retract unconfirmed recent samples, retain the preceding good history.
             while (count_ && (!haveUpdate_ ||
-                   now-beats_[(head_+BEAT_CAPACITY-1)%BEAT_CAPACITY].time <= now-lastUpdate_)) {
+                   now-beats_[(head_+BEAT_CAPACITY-1)%BEAT_CAPACITY].time < now-lastUpdate_)) {
                 head_ = (head_+BEAT_CAPACITY-1)%BEAT_CAPACITY;
                 --count_;
             }
@@ -438,11 +505,12 @@ void Observer::update(uint32_t now, const Context &context) {
         return;
     }
     if (windowStarted_ && breakPending_) {
-        invalidate(result_.windowMs < WINDOW_MS ? Status::WARMUP : Status::GAP);
+        invalidate(initialWarmupComplete_ ? Status::GAP : Status::WARMUP);
         result_.coverage = 0;
         return;
     }
-    if (haveAnalysis_ && now-lastAnalysis_ < ANALYSIS_INTERVAL_MS) return;
+    if (!initialWarmupJustCompleted &&
+        haveAnalysis_ && now-lastAnalysis_ < ANALYSIS_INTERVAL_MS) return;
     haveAnalysis_ = true; lastAnalysis_ = now;
     estimate(now);
 }

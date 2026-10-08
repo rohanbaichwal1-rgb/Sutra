@@ -12,9 +12,9 @@ stress, and PDR is context rather than a trigger.
 |---|---|---|
 | PPG and LMS beat processing | Cleans PPG with a motion-informed LMS path, detects usable beats, and calculates RMSSD. | Rejected, stale, or no-contact data cannot qualify a trigger. |
 | Three RMSSD references | Uses a startup session median, an adapting five-minute short reference, and a persisted seven-session median. | Seven startup sessions are a prototype stand-in for daily measurements. |
-| P1/P2 episode logic | Detects sustained RMSSD drops, prioritizes P2, and requires stable recovery before rearming. | P1/P2 are research interventions, not clinical conclusions. |
-| Haptic patterns | Generates a 5 s random P1 flutter and a 10 s paced P2 sweep at a 40% output cap. | Firmware currently drives one DA7280/LRA on mux channel 0; the library is three-motor capable. |
-| PDR observer | Estimates respiratory-rate context from RIAV/RIFV, maintains a resting baseline, and summarizes P2 rate match. | It never gates, changes, or triggers P1/P2. |
+| P1 episode logic | Triggers at a 10% RMSSD drop held for 30 s, then requires stable recovery before rearming. | One trigger with a conditionally scheduled follow-up; not a clinical conclusion. |
+| Haptic patterns | Generates a 5 s P1 flutter and automatically starts a 10 s follow-up sweep five seconds after the P1 trigger at the unchanged 20% output scale. | Firmware currently drives one DA7280/LRA on mux channel 0; the library is three-motor capable. |
+| PDR observer | Estimates respiratory-rate context from RIAV/RIFV for display. | It never gates, changes, or triggers either P1 stage. |
 | BLE telemetry | Provides grouped UTF-8 read fields plus a notification stream that mirrors serial output. | Notifications are best effort, not a beat-by-beat recording. |
 
 ## System flow
@@ -28,7 +28,9 @@ flowchart LR
     Beat --> PDR[PDR observer]
     Ref --> Trigger{Sustained drop<br/>and quality gates?}
     Trigger -- P1 --> Flutter[P1: 5 s flutter]
-    Trigger -- P2, priority --> Sweep[P2: 10 s pacing]
+    Flutter --> Delay[Wait 5 s from P1 trigger]
+    Delay --> Sweep[P1 follow-up: 10 s pacing]
+    Delay -. signal/contact/activity/gap/motor fault .-> Cancel[Cancel follow-up for this trigger]
     Flutter --> Driver[DA7280 via TCA9548A]
     Sweep --> Driver
     Beat --> Report[Serial + BLE telemetry]
@@ -42,27 +44,30 @@ flowchart LR
 flowchart TD
     A[Fresh RMSSD + valid IMU + LOW motion] -->|No| Stop[Pause holds and collection]
     A -->|Yes| B[Compare with each available reference]
-    B --> C{Drop at least 10%<br/>for 120 s?}
-    C -->|Yes| P2[P2 trigger and 10 s sweep]
-    C -->|No| D{Drop at least 5%<br/>for 30 s?}
+    B --> D{Drop at least 10%<br/>for 30 s?}
     D -->|Yes| P1[P1 trigger and 5 s flutter]
     D -->|No| Watch[Continue monitoring]
-    P1 --> Recover[Require 60 s stable recovery]
-    P2 --> Recover
+    P1 --> Delay[Wait 5 s from P1 trigger]
+    Delay --> Follow[Stop flutter; start follow-up once]
+    Delay -. signal/contact/activity/gap/motor fault .-> Cancel[Cancel follow-up for this trigger]
+    Follow --> Recover[Require 60 s stable recovery]
+    Cancel --> Recover
     Recover --> Watch
 ```
 
-P2 wins when both conditions are reached together. An active P2 cannot be
-interrupted by P1; a P2 can preempt P1.
+Follow-up is issued once per P1 trigger. A recovered RMSSD deviation or changed
+reference does not cancel or restart the delay; signal/contact/activity, timing,
+or motor failures do.
+The initial flutter is stopped cleanly before the follow-up starts.
 
-## P2 pacing chart
+## P1 follow-up pacing chart
 
 The following timeline is the three-logical-motor pattern. In the current
 single-motor hardware configuration, only the left/Motor 1 spans are actuated.
 
 ```mermaid
 gantt
-    title One 10-second P2 breathing cycle
+    title One 10-second P1 follow-up breathing cycle
     dateFormat  X
     axisFormat %Ls
     section Left / Motor 1

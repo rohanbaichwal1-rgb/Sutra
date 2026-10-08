@@ -44,12 +44,12 @@ void pdrChannel(Line &line, const char *name, const pdr::ChannelDiagnostics &d) 
     line.append(" %sMod:",name); line.value(100*d.modulation,"%",3);
     line.append(" %sWhy:%s",name,pdr::channelStatusName(d.status));
 }
-const char *protocolAction(const Snapshot &s, bool p1) {
-    const auto playback = p1 ? s.p1Playback : s.p2Playback;
+const char *protocolAction(const Snapshot &s) {
     if (s.hapticFault) return "MOTOR_FAULT";
-    if (playback == haptics::Playback::STARTED) return "PLAYING";
-    if (p1 ? s.p1Triggered : s.p2Triggered) return "WAIT_RECOVERY";
-    if (p1 && s.p2Playback == haptics::Playback::STARTED) return "P2_PRIORITY";
+    if (s.followUpPlayback == haptics::Playback::STARTED) return "FOLLOW_UP_PLAYING";
+    if (s.p1Playback == haptics::Playback::STARTED) return "PLAYING";
+    if (s.followUp == rmssd::FollowUp::PENDING) return "WAIT_FOLLOW_UP";
+    if (s.p1Triggered) return "WAIT_RECOVERY";
     if (!isfinite(s.session) && !isfinite(s.shortReference) && !isfinite(s.personal)) return "NO_REFERENCE";
     if (!s.fresh || !s.imuOK) return "INVALID_INPUT";
     if (s.motion != 0) return "MOTION_PAUSED";
@@ -67,7 +67,6 @@ const char *groupName(Group group) {
     case Group::LMS: return "LMS";
     case Group::PDR: return "PDR";
     case Group::P1: return "P1";
-    case Group::P2: return "P2";
     case Group::SESSION: return "SessionBaseline";
     case Group::SHORT: return "Short";
     case Group::PERSONAL: return "PersonalBaseline";
@@ -108,8 +107,14 @@ bool formatLine(Group group, const Snapshot &s, char *output, size_t capacity) {
         if (!p.valid) line.append(" | Reason:%s",pdr::statusName(p.status));
         pdrChannel(line,"AV",p.av);
         pdrChannel(line,"FV",p.fv);
-        line.append(" | Win:%.1f/45s | Cover:",p.windowMs/1000.0f);
-        line.value(100*p.coverage,"%",1);
+        line.append(" | Win:%.1f/45s | Cover:", p.windowMs/1000.0f);
+line.value(100 * p.coverage, "%", 1);
+
+line.append(" | CoverAV:");
+line.value(100 * p.coverageAV, "%", 1);
+
+line.append(" | CoverFV:");
+line.value(100 * p.coverageFV, "%", 1);
         line.append(" | BeatAge:"); age(line,p.beatAgeMs);
         line.append(" | BeatGap:%lums",(unsigned long)p.lastBeatGapMs);
         line.append(" | Resets:%lu | LastReset:%s",(unsigned long)p.resets,
@@ -118,18 +123,19 @@ bool formatLine(Group group, const Snapshot &s, char *output, size_t capacity) {
             line.append("@%lums Gap:%lums",(unsigned long)p.resetTime,(unsigned long)p.resetGapMs);
         break;
     }
-    case Group::P1:
-    case Group::P2: {
-        bool p1 = group == Group::P1;
-        const uint32_t *timers = p1 ? s.p1Ms : s.p2Ms;
-        const uint32_t required = p1 ? rmssd::P1_HOLD_MS : rmssd::P2_HOLD_MS;
+    case Group::P1: {
+        const uint32_t *timers = s.p1Ms;
+        const uint32_t required = rmssd::P1_HOLD_MS;
         line.append("Session:"); hold(line,timers[0],s.session,required);
         line.append(" | Short:"); hold(line,timers[1],s.shortReference,required);
         line.append(" | 7Session:"); hold(line,timers[2],s.personal,required);
-        line.append(" | Triggered:%s | Source:%s",yn(p1 ? s.p1Triggered : s.p2Triggered),
-            rmssd::sourceName(p1 ? s.p1Source : s.p2Source));
+        line.append(" | Triggered:%s | Source:%s",yn(s.p1Triggered),
+            rmssd::sourceName(s.p1Source));
         line.append(" | Playback:%s | Action:%s",
-            haptics::playbackName(p1 ? s.p1Playback : s.p2Playback),protocolAction(s,p1));
+            haptics::playbackName(s.p1Playback),protocolAction(s));
+        line.append(" | FollowUp:%s | FollowUpPlayback:%s",rmssd::followUpName(s.followUp),
+                    haptics::playbackName(s.followUpPlayback));
+        line.append(" | TriggerCount:%lu",(unsigned long)s.p1TriggerCount);
         break;
     }
     case Group::SESSION:

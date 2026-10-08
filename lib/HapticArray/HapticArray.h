@@ -29,6 +29,15 @@ struct ArrayConfig
 
 enum class ArrayError : uint8_t { NONE, CONFIG, I2C, CHIP_ID, DRIVER_FAULT };
 
+// Raw DA7280 registers retained for startup troubleshooting.  These values
+// are observational: reading them does not clear an event or alter playback.
+struct DriverDiagnostics
+{
+    uint8_t event = 0;
+    uint8_t warning = 0;
+    uint8_t status = 0;
+};
+
 class Array
 {
 public:
@@ -36,6 +45,8 @@ public:
     bool begin(); // Call after power has been stable for at least 1.5 ms.
     bool apply(const Frame &frame);
     bool pollFaults();
+    bool readDiagnostics(unsigned motor, DriverDiagnostics &diagnostics);
+    static bool hasFatalFault(const DriverDiagnostics &diagnostics);
     bool stopAll();
     bool ready() const { return ready_; }
     bool shutdownPending() const { return shutdownPending_; }

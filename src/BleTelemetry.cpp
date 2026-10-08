@@ -201,7 +201,8 @@ void worker(void *) {
             uuid,
             sizeof(uuid),
             "7d2a%04x-8f5a-4b10-9b6d-6f7574726100",
-            0x101 + i);
+            // Keep existing UUIDs stable; retired slot 0105 remains unused.
+            0x101 + i + (i >= static_cast<unsigned>(Group::SESSION) ? 1 : 0));
 
         values[i] =
             service->createCharacteristic(

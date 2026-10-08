@@ -1,7 +1,7 @@
 ﻿# RMSSD references in the prototype
 
 Current RMSSD uses the existing 60-second interval window and beat detector.
-P1/P2 has three independent comparison paths:
+P1 has three independent comparison paths:
 
 | Reference | Becomes available | Behaviour |
 |---|---|---|
@@ -20,16 +20,17 @@ flowchart TD
     Gate -- No --> Reject[Exclude from RMSSD/PDR]
     Gate -- Yes --> Window[60 s RMSSD window]
     Window --> RMSSD[sqrt(mean(successive IBI difference squared))]
-    RMSSD --> Quality{Fresh signal, valid IMU,<br/>LOW motion, no haptics?}
-    Quality -- No --> Pause[Pause collection and continuous holds]
+    RMSSD --> Quality{Fresh signal, valid IMU,<br/>LOW motion, no post-exercise wait?}
+    Quality -- No --> Pause[Break holds / cancel pending follow-up]
     Quality -- Yes --> Refs[Compare session, short, and personal references]
-    Refs --> P2{Drop >=10% for 120 s?}
-    P2 -- Yes --> P2Fire[Trigger P2]
-    P2 -- No --> P1{Drop >=5% for 30 s?}
-    P1 -- Yes --> P1Fire[Trigger P1]
+    Refs --> P1{Drop >=10% for 30 s?}
+    P1 -- Yes --> P1Fire[Trigger P1: flutter and 5 s delay]
     P1 -- No --> Refs
-    P1Fire --> Rearm[60 s stable recovery below 10% drop]
-    P2Fire --> Rearm
+    P1Fire --> Follow[Wait 5 s from P1 trigger]
+    Follow --> Sweep[Stop flutter; start 10 s follow-up once]
+    Follow -. signal/contact/activity/gap fault .-> Cancel[Cancel follow-up for this trigger]
+    Sweep --> Rearm[60 s stable recovery below 10% drop]
+    Cancel --> Rearm
 ```
 
 ## Current session and saved sessions
@@ -90,7 +91,7 @@ post-exercise recovery pause collection. Readings keep expiring during pauses,
 so `ShortValid` can decrease. Contact changes clear the short buffer but retain
 episode latches, the completed session baseline and saved history.
 
-P1/P2 compares directly against the current live median. If adaptation reduces
+P1 compares directly against the current live median. If adaptation reduces
 deviation below a trigger threshold, that path's pending hold resets. The fixed
 session baseline provides a separate comparison for sustained drops.
 
@@ -101,27 +102,33 @@ recovery is armed by the first qualifying resting block. Startup motion before
 that block does not start post-exercise recovery. MODERATE never starts or resets
 this wait; it pauses the countdown and preserves accrued LOW time. LOW resumes
 it. Unobserved time does not count. Both MODERATE and HIGH interrupt collection
-blocks and P1/P2 continuous holds.
+blocks and P1 continuous holds, and cancel a pending follow-up.
 
-## P1/P2 logic
+## P1 logic
 
-Each available reference has its own continuous timers:
-
-- P1: current RMSSD at least 5% below that reference for 30 seconds (current prototype test setting).
-- P2: current RMSSD at least 10% below that reference for 120 seconds (current prototype test setting).
-
-Both timers run together once P2 is crossed; P1 keeps its original start time,
-including after it fires. Returning from P2 into the P1-only range resets P2
-but keeps P1 counting. With qualified data and an available, unchanged reference,
-P1 resets only when RMSSD rises above its 5%-drop boundary. Equality qualifies.
-For a 100 ms reference: 95 ms starts P1; 90 ms starts P2 as well; 92 ms resets
-only P2; above 95 ms resets both. These are independent timers for each reference.
+Each available reference has its own continuous 30-second hold at a drop of
+at least 10%. Equality qualifies: a 100 ms baseline requires RMSSD <=90 ms.
+There is one trigger and one boot-lifetime trigger counter, not a second stress
+threshold/timer. Both vibration stages belong to that same P1 trigger.
 
 One completed path suffices; elapsed time cannot transfer between paths. Invalid
 input, non-LOW motion or post-exercise recovery breaks holds. RMSSD stability is
 required for fixed session collection and episode recovery, but not for short
-adaptation or timing a drop. Each
-level fires once per episode; P2 takes haptic priority.
+adaptation or timing a drop. P1 fires once per episode.
+
+P1 starts the existing five-second flutter immediately. A nonblocking five-second
+delay starts at the trigger timestamp, not the first motor write. Once scheduled,
+the follow-up does not depend on the RMSSD deviation, reference availability, or
+baseline changes during that delay. Signal/contact/activity failures permanently
+cancel follow-up for that trigger. Unobserved gaps over the existing 2.5-second
+limit cancel too.
+The motor-active collection gate alone does not cancel follow-up; actual invalid
+sensor readings or disqualifying motion during vibration do.
+
+At five seconds, hardware is confirmed stopped before the unchanged ten-second P1
+follow-up sweep starts once. It is not retried on hardware failure.
+Cancellation does not clear the episode latch. After follow-up starts, it runs
+to completion unless a hardware fault stops it. PDR does not gate either stage.
 
 Sources identify `SESSION`, `SHORT_TERM`, `LONG_TERM`, or explicit combinations
 such as `SESSION+SHORT_TERM`. `LONG_TERM` means the seven-session personal value,
@@ -151,13 +158,13 @@ RMSSD interval after seeding), `RRrangeReject` (outside 300–2000 ms), `HRrejec
 last interval offered to RMSSD; `LastRejectRR` is the last rejected there, not
 necessarily the latest candidate. Zero means none has been seen yet.
 These diagnostics do not relax rejection/freshness rules or carry stale values
-into P1/P2 timers. New logs are needed to distinguish the remaining dropout causes.
+into P1 timers. New logs are needed to distinguish the remaining dropout causes.
 
-P1/P2 additionally show playback outcome and next-action status; System retains
+P1 additionally shows both playback outcomes and next-action status; System retains
 the startup motor-test result and driver fault bits. See
 [haptic-protocols.md](haptic-protocols.md) for these command-status semantics.
 
-Serial and BLE use separate lines for Normal, LMS, PDR, P1, P2, SessionBaseline,
+Serial and BLE use separate lines for Normal, LMS, PDR, P1, SessionBaseline,
 Short, PersonalBaseline and System. Each line includes device uptime.
 
 - `SessionBaseline | RMSSD:<value>ms` with `State:FROZEN` after completion;
@@ -170,8 +177,9 @@ Short, PersonalBaseline and System. Each line includes device uptime.
 - `Short` shows `State:ADAPTING`, `COLLECTING`, or `PAUSED`. `Gate` explains the
   blocker. `Valid` is qualifying time still in the rolling window; `Block` and
   `Breaks` show block progress and interruptions, including brief interruptions.
-- `P1` and `P2` each show independent `Session`, `Short`, and `7Session` hold
-  timers, followed by `Triggered` and `Source`. Unavailable reference paths show `--`.
+- `P1` shows independent `Session`, `Short`, and `7Session` hold timers, followed
+  by `Triggered`, `Source`, playback/action, `FollowUp`, `FollowUpPlayback`, and
+  `TriggerCount`. Unavailable reference paths show `--`.
 - `System` includes `PostExercise` with remaining LOW time and `PAUSED` on MODERATE.
   `Rearm:0/60s` appears only after a trigger until recovery completes. Rearming
   needs 60 seconds of stable, qualified data below 10% drop against all available

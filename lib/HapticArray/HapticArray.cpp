@@ -9,12 +9,16 @@ constexpr uint8_t CHIP_REV = 0x00;
 constexpr uint8_t IRQ_EVENT1 = 0x03;
 constexpr uint8_t IRQ_WARNING = 0x04;
 constexpr uint8_t IRQ_STATUS1 = 0x06;
-constexpr uint8_t CIF_I2C1 = 0x08;
+constexpr uint8_t FRQ_LRA_PER_H = 0x0A;
+constexpr uint8_t FRQ_LRA_PER_L = 0x0B;
+constexpr uint8_t ACTUATOR1 = 0x0C;
+constexpr uint8_t ACTUATOR2 = 0x0D;
+constexpr uint8_t ACTUATOR3 = 0x0E;
+constexpr uint8_t CALIB_V2I_H = 0x0F;
+constexpr uint8_t CALIB_V2I_L = 0x10;
 constexpr uint8_t TOP_CFG1 = 0x13;
-constexpr uint8_t TOP_CFG2 = 0x14;
 constexpr uint8_t TOP_CTL1 = 0x22;
 constexpr uint8_t TOP_CTL2 = 0x23;
-constexpr uint8_t SEQ_CTL1 = 0x24;
 constexpr uint8_t FAULT_MASK = 0xDA; // OC, actuator, sequence, temperature, UVLO
 }
 
@@ -22,11 +26,14 @@ Array::Array(I2cBus &bus, const ArrayConfig &config) : bus_(bus), config_(config
 
 bool Array::select(unsigned motor)
 {
-    if (!configuredMotor(motor) || config_.channels[motor] > 7) return false;
-    const uint8_t mask = static_cast<uint8_t>(1U << config_.channels[motor]);
+    if (!configuredMotor(motor) || config_.channels[motor] > 7)
+        return false;
+
+    const uint8_t mask =
+        static_cast<uint8_t>(1U << config_.channels[motor]);
+
     return bus_.write(config_.muxAddress, &mask, 1);
 }
-
 bool Array::disconnect()
 {
     const uint8_t mask = 0;
@@ -90,19 +97,22 @@ bool Array::begin()
             return fail(ArrayError::I2C, motor + 1);
         if (revision != 0xBA) return fail(ArrayError::CHIP_ID, motor + 1);
 
-        // Zero amplitude and stop before configuring anything. Keep the
-        // SmartElex module's existing/default actuator voltage, current,
-        // impedance and resonant-frequency registers (0x0A..0x10).
-        // No unrelated SparkFun defaultMotor() profile is installed.
-        if (!writeReg(reg::TOP_CTL2, 0) || !writeReg(reg::TOP_CTL1, 0) ||
-            // A disconnected mux branch must tolerate long gaps in SCL.
-            !modifyReg(reg::CIF_I2C1, 0xC0, 0) ||
-            // LRA, host-cleared faults; BEMF, frequency tracking, acceleration,
-            // and rapid stop enabled. These loops require frequency tracking.
-            !modifyReg(reg::TOP_CFG1, 0xA0, 0x1E) ||
-            !modifyReg(reg::TOP_CFG2, 0x10, 0) || // unsigned waveform data
-            !modifyReg(reg::SEQ_CTL1, 0x02, 0) || // normal waveform
-            !writeReg(reg::IRQ_EVENT1, 0xFF))
+        // Register-equivalent of the known-working sketch's:
+        // begin(); defaultMotor(); enableFreqTrack(false);
+        // setOperationMode(DRO_MODE); setVibrate(0).
+        // defaultMotor() installs SparkFun's LRA profile: 2.106 V nominal,
+        // 2.26 V absolute, 165.4 mA, 13.8 ohm and 170 Hz.  Keep the same
+        // read-modify-write behavior for TOP_CFG1/ACTUATOR3/Frequency-LSB.
+        if (!modifyReg(reg::TOP_CFG1, 0x28, 0x00) || // LRA + frequency tracking OFF
+            !writeReg(reg::ACTUATOR2, 0x60) ||      // 2.26 V
+            !writeReg(reg::ACTUATOR1, 0x5A) ||      // 2.106 V
+            !modifyReg(reg::ACTUATOR3, 0x1F, 0x13) || // 165.4 mA
+            !writeReg(reg::CALIB_V2I_L, 0xC5) ||    // 13.8 ohm at 165.4 mA
+            !writeReg(reg::CALIB_V2I_H, 0x00) ||
+            !writeReg(reg::FRQ_LRA_PER_H, 0x22) ||  // 170 Hz LRA period
+            !modifyReg(reg::FRQ_LRA_PER_L, 0x7F, 0x3B) ||
+            !modifyReg(reg::TOP_CTL1, 0x07, 0x01) || // DRO mode
+            !writeReg(reg::TOP_CTL2, 0))            // setVibrate(0)
             return fail(ArrayError::I2C, motor + 1);
         levels_[motor] = 0;
         driving_[motor] = false;
@@ -110,7 +120,27 @@ bool Array::begin()
     if (!disconnect()) return fail(ArrayError::I2C);
     shutdownPending_ = false;
     ready_ = true;
-    return pollFaults();
+    // The working sketches begin/configure each selected DA7280 and then
+    // proceed to playback. Do not add a full three-driver diagnostic sweep
+    // here: a transient read on another mux branch must not prevent startup.
+    return true;
+}
+
+bool Array::readDiagnostics(unsigned motor, DriverDiagnostics &diagnostics)
+{
+    if (!ready_ || !configuredMotor(motor)) return false;
+
+    const bool ok = select(motor) &&
+                    readReg(reg::IRQ_EVENT1, diagnostics.event) &&
+                    readReg(reg::IRQ_WARNING, diagnostics.warning) &&
+                    readReg(reg::IRQ_STATUS1, diagnostics.status);
+    const bool disconnected = disconnect();
+    return ok && disconnected;
+}
+
+bool Array::hasFatalFault(const DriverDiagnostics &diagnostics)
+{
+    return ((diagnostics.event | diagnostics.status) & reg::FAULT_MASK) != 0;
 }
 
 uint8_t Array::amplitudeCode(uint16_t level, uint8_t scalePercent)

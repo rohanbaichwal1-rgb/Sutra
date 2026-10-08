@@ -1,9 +1,11 @@
 # Haptic actuation
 
-The PoC uses the existing RMSSD P1/P2 events. It does not invent a State Alpha
-classifier or confidence score. P1 runs for five seconds; P2 runs for one complete
-ten-second breathing cycle for testing. P2 replaces an active P1; a P1 request
-cannot interrupt P2.
+The PoC uses one RMSSD P1 trigger. The initial flutter lasts five seconds.
+A nonblocking five-second delay starts at the trigger timestamp. At five seconds,
+stop the initial output and start the P1 follow-up sweep once. It retains the
+existing ten-second breathing cycle. RMSSD recovery or reference changes during
+the delay do not cancel it; signal/contact/activity failures and timing or motor
+faults do. Recovery/rearm remains unchanged.
 
 ## Current hardware scope
 
@@ -12,25 +14,25 @@ but the checked-in firmware currently enables **one** SmartElex DA7280 module:
 Motor 1 on TCA9548A channel 0. The left/centre/right descriptions below document
 the three-channel pattern design and its host tests; they are not a claim that
 the production configuration currently drives channels 1 and 2. With the current
-`motorCount = 1` configuration, only the Motor 1 portions of P1 and P2 are sent.
+`motorCount = 1` configuration, only Motor 1 portions of both P1 stages are sent.
 
 Adding the remaining modules requires wiring them to distinct mux channels and
 changing the firmware configuration deliberately. It is not enabled merely by
 using the three-motor pattern generator.
 
-The RMSSD drop thresholds remain 5% for P1 and 10% for P2, with trigger holds
-of 30 seconds and 120 seconds respectively. These playback durations include
+The P1 RMSSD drop threshold is 10%, with a 30-second trigger hold. There is no
+independent second trigger or threshold. These playback durations include
 the existing pattern's quiet intervals. The reusable pattern generator supports
-independent P1 taps across all three positions and the P2 left/right/centre sweep
+independent P1 taps across all three positions and the follow-up left/right/centre sweep
 below. The currently enabled single module receives only its Motor 1 frames.
 
-The current single-motor firmware sets `ArrayConfig::outputScalePercent = 40`.
-It scales the original 0–100% envelope into 0–40%, preserving ramps and pauses
-instead of forcing a fixed ON intensity. P1's original 90% taps become 36%;
-P2's 10–50% ramps become 4–20%, its 60% hold becomes 24%, and its 30–0%
-exhale becomes 12–0%. The original envelopes are described below.
-Percentages are converted to raw 0–127 DRO codes with rounding: a 40% full-scale
-command is code 51, not the reference sketch's raw code 40. Phase timing, fault
+The unchanged single-motor firmware sets `ArrayConfig::outputScalePercent = 20`.
+It scales the original 0–100% envelope into 0–20%, preserving ramps and pauses
+instead of forcing a fixed ON intensity. P1's original 90% taps become 18%;
+the follow-up's 10–50% ramps become 2–10%, its 60% hold becomes 12%, and its 30–0%
+exhale becomes 6–0%. The original envelopes are described below.
+Percentages are converted to raw 0–127 DRO codes with rounding: a 20% full-scale
+command is code 25, not the reference sketch's raw code 40. Phase timing, fault
 handling and motor electrical settings are unchanged. The library default of
 100 preserves the original envelope; 0 mutes it.
 
@@ -75,7 +77,7 @@ reported because delivered strength can be lower than requested.
 - All outputs stop at completion. A final tap is shortened only if it can still
   meet the 60 ms minimum; otherwise that tap is omitted.
 
-## P2: resonant pacing sweep
+## P1 follow-up: resonant pacing sweep
 
 | Time within each cycle | Motor 1 | Motor 2 | Motor 3 |
 |---|---|---|---|
@@ -97,11 +99,12 @@ toward or away from P6.
 
 ```mermaid
 flowchart TD
-    Trigger[RMSSD P1 or P2 event] --> Priority{P2 active or requested?}
-    Priority -- P2 --> P2[P2 replaces P1; start paced sweep]
-    Priority -- P1 only --> P1[Start 5 s random flutter]
+    Trigger[RMSSD P1 event] --> P1[Start 5 s flutter and nonblocking delay]
+    P1 --> Delay[Wait 5 s from P1 trigger]
+    Delay --> Follow[Confirm stop; start follow-up sweep once]
+    Delay -. signal/contact/activity/gap/motor fault .-> Cancel[Cancel follow-up for this trigger]
     P1 --> Frame[Service envelope every about 10 ms]
-    P2 --> Frame
+    Follow --> Frame
     Frame --> Poll[Poll DA7280 faults every 100 ms]
     Poll --> OK{I2C and driver healthy?}
     OK -- Yes --> Done{Pattern complete?}
@@ -116,21 +119,23 @@ DA7280 at a time. A previously addressed driver keeps its amplitude after mux
 disconnect, so multi-motor envelopes can overlap when configured.
 
 Before sensor initialization, startup runs `BOOT_TEST`: all three logical motors
-on mux channels 0–2 receive the 40%-capped command for ten seconds. Confirm each
+on mux channels 0–2 receive the configured startup intensity for three seconds. Confirm each
 motor physically by touch. The test uses a separate three-motor array; normal
-P1/P2 playback remains configured for Motor 1 only. If a test branch is missing
+Both P1 stages remain configured for Motor 1 only. If a test branch is missing
 or faults, the failure is logged and sensor initialization continues.
 
 While a protocol is playing, frames are serviced about every 10 ms and driver
 fault registers are polled every 100 ms. At normal completion the firmware sends
-a stop command and logs `[HAPTIC] protocol complete`. I2C failures and driver
+a stop command and logs P1 initial/follow-up completion. I2C failures and driver
 faults stop the sequence; shutdown is retried every 250 ms if its acknowledgement
 is uncertain. `FAULT_STOP_PENDING` means the firmware cannot yet confirm a stop.
-Haptic state is reported as `OFF`, `P1_FLUTTER`, `P2_SWEEP`, `FAULT`, or
+Haptic state is reported as `OFF`, `P1_FLUTTER`, `P1_FOLLOW_UP`, `FAULT`, or
 `FAULT_STOP_PENDING`.
 
-P2 has priority when P1 and P2 trigger together, and P2 immediately replaces an
-active P1. A P1 request never interrupts P2. Reference collection/recovery sees
+The follow-up replaces a still-running flutter only after a successful hardware
+stop. New initial requests cannot interrupt active patterns. Serial reports P1
+trigger, follow-up start/cancellation/completion; the P1 telemetry line includes
+both playback outcomes and follow-up scheduling state. Reference collection/recovery sees
 the whole intervention as active, including P1 gaps. Haptics remain disabled
 after a latched driver fault until reboot. Software can confirm commands and I2C
 acknowledgements, not physical vibration; confirm motor response by touch. The

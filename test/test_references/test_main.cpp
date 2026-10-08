@@ -1,5 +1,6 @@
 #include <unity.h>
 #include <RmssdReferences.h>
+#include <math.h>
 
 using namespace rmssd;
 
@@ -82,17 +83,16 @@ void test_old_readings_expire_in_wall_time()
     TEST_ASSERT_EQUAL_UINT(0, f.monitor.sampleCount());
 }
 
-void test_ten_percent_drop_triggers_p1_at_the_configured_five_percent_threshold()
+void test_configured_drop_triggers_p1_after_30_seconds()
 {
     Fixture f;
     f.initialize();
-    f.input.current = 90;
+    f.input.current = 100.0f - P1_DROP_PCT;
     f.tick();
     f.seconds(29);
     TEST_ASSERT_FALSE(f.monitor.p1Triggered());
     f.tick();
     TEST_ASSERT_TRUE(f.monitor.p1Triggered());
-    TEST_ASSERT_FALSE(f.monitor.p2Triggered());
     TEST_ASSERT_EQUAL_UINT32(300000, f.monitor.validDurationMs());
     // The 5-minute median remains at its former value during this initial
     // 30-second drop, so the trigger cannot be attributed to a changed reference.
@@ -100,7 +100,7 @@ void test_ten_percent_drop_triggers_p1_at_the_configured_five_percent_threshold(
     TEST_ASSERT_EQUAL_STRING("OPEN", collectionGateName(f.monitor.collectionGate()));
 }
 
-void test_both_paths_trigger_at_30_and_120_seconds()
+void test_both_paths_trigger_once_after_30_seconds()
 {
     Fixture f;
     f.initialize();
@@ -111,12 +111,10 @@ void test_both_paths_trigger_at_30_and_120_seconds()
     f.seconds(29);
     TEST_ASSERT_FALSE(f.monitor.p1Triggered());
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::BOTH), static_cast<int>(f.tick().p1));
-    f.seconds(89);
-    TEST_ASSERT_FALSE(f.monitor.p2Triggered());
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::BOTH), static_cast<int>(f.tick().p2));
+    f.seconds(90);
+    TEST_ASSERT_TRUE(f.monitor.p1Triggered());
     f.seconds(200);
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::NONE), static_cast<int>(f.last.p1));
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::NONE), static_cast<int>(f.last.p2));
     TEST_ASSERT_TRUE(f.monitor.shortAvailable());
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 70, f.monitor.shortReference());
 }
@@ -129,7 +127,6 @@ void test_short_path_does_not_require_long_term_baseline()
     f.tick();
     f.seconds(30);
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::SHORT_TERM), static_cast<int>(f.last.p1));
-    TEST_ASSERT_FALSE(f.monitor.p2Triggered());
 }
 
 void test_long_term_path_does_not_require_short_reference()
@@ -142,7 +139,6 @@ void test_long_term_path_does_not_require_short_reference()
     TEST_ASSERT_FALSE(f.monitor.shortAvailable());
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::LONG_TERM), static_cast<int>(f.last.p1));
     f.seconds(90);
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::LONG_TERM), static_cast<int>(f.last.p2));
 }
 
 void test_source_timers_cannot_borrow_elapsed_time()
@@ -163,7 +159,36 @@ void test_source_timers_cannot_borrow_elapsed_time()
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::SHORT_TERM), static_cast<int>(f.last.p1));
 }
 
-void test_invalid_input_and_report_gaps_break_continuous_timers()
+void test_moderate_motion_continues_running_p1_hold_but_high_motion_resets_it()
+{
+    Fixture f;
+    f.input.sessionAvailable = true;
+    f.input.sessionBaseline = 100;
+    f.input.current = 95; // Exactly the configured 5% P1 threshold.
+    f.tick();
+    f.seconds(14);
+    TEST_ASSERT_EQUAL_UINT32(14000, f.monitor.p1SessionHoldMs(f.input.now));
+
+    f.input.motion = Motion::MODERATE_MOTION;
+    f.seconds(10);
+    // MODERATE neither resets nor pauses the P1 persistence duration.
+    TEST_ASSERT_EQUAL_UINT32(24000, f.monitor.p1SessionHoldMs(f.input.now));
+    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
+    f.seconds(5);
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::SESSION), static_cast<int>(f.tick().p1));
+
+    Fixture high;
+    high.input.sessionAvailable = true;
+    high.input.sessionBaseline = 100;
+    high.input.current = 95;
+    high.tick();
+    high.seconds(10);
+    high.input.motion = Motion::HIGH_MOTION;
+    high.tick();
+    TEST_ASSERT_EQUAL_UINT32(0, high.monitor.p1SessionHoldMs(high.input.now));
+}
+
+void test_blank_dev_bridges_running_p1_hold_but_report_gaps_still_reset()
 {
     Fixture f;
     f.initialize();
@@ -174,13 +199,91 @@ void test_invalid_input_and_report_gaps_break_continuous_timers()
     f.tick();
     f.input.signalGood = true;
     f.tick();
-    f.seconds(20);
-    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
-    f.input.now += 5000;
-    f.monitor.update(f.input);
-    f.seconds(29);
+    f.seconds(7);
     TEST_ASSERT_FALSE(f.monitor.p1Triggered());
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::SHORT_TERM), static_cast<int>(f.tick().p1));
+
+    Fixture gap;
+    gap.initialize();
+    gap.input.current = 80;
+    gap.tick();
+    gap.seconds(20);
+    gap.input.now += 5000;
+    gap.monitor.update(gap.input);
+    gap.seconds(29);
+    TEST_ASSERT_FALSE(gap.monitor.p1Triggered());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::SHORT_TERM), static_cast<int>(gap.tick().p1));
+}
+
+void test_running_p1_hold_bridges_up_to_ten_blank_dev_samples()
+{
+    Fixture f;
+    f.input.sessionAvailable = true;
+    f.input.sessionBaseline = 100;
+    f.input.current = 80;
+    f.tick();
+    f.seconds(14);
+    for (unsigned i = 0; i < 5; ++i)
+    {
+        f.input.signalGood = false;
+        f.input.current = NAN;
+        f.monitor.interruptSignalContinuity();
+        f.tick();
+    }
+    TEST_ASSERT_EQUAL_UINT32(19000, f.monitor.p1SessionHoldMs(f.input.now));
+    f.input.signalGood = true;
+    f.input.current = 80;
+    f.tick();
+    f.seconds(9);
+    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::SESSION), static_cast<int>(f.tick().p1));
+}
+
+void test_valid_below_threshold_after_blank_dev_resets_p1_hold()
+{
+    Fixture f;
+    f.input.sessionAvailable = true;
+    f.input.sessionBaseline = 100;
+    f.input.current = 80;
+    f.tick();
+    f.seconds(14);
+    for (unsigned i = 0; i < 5; ++i)
+    {
+        f.input.signalGood = false;
+        f.input.current = NAN;
+        f.tick();
+    }
+    f.input.signalGood = true;
+    f.input.current = 100;
+    f.tick();
+    TEST_ASSERT_EQUAL_UINT32(0, f.monitor.p1SessionHoldMs(f.input.now));
+}
+
+void test_eleventh_consecutive_blank_dev_resets_and_blank_cannot_start_p1_hold()
+{
+    Fixture f;
+    f.input.sessionAvailable = true;
+    f.input.sessionBaseline = 100;
+    f.input.current = 80;
+    f.tick();
+    for (unsigned i = 0; i < P1_MAX_CONSECUTIVE_BLANK_DEV; ++i)
+    {
+        f.input.signalGood = false;
+        f.input.current = NAN;
+        f.tick();
+    }
+    TEST_ASSERT_EQUAL_UINT32(P1_MAX_CONSECUTIVE_BLANK_DEV * 1000UL,
+                             f.monitor.p1SessionHoldMs(f.input.now));
+    f.tick();
+    TEST_ASSERT_EQUAL_UINT32(0, f.monitor.p1SessionHoldMs(f.input.now));
+
+    Fixture blankOnly;
+    blankOnly.input.sessionAvailable = true;
+    blankOnly.input.sessionBaseline = 100;
+    blankOnly.input.signalGood = false;
+    blankOnly.input.current = NAN;
+    blankOnly.seconds(P1_MAX_CONSECUTIVE_BLANK_DEV);
+    TEST_ASSERT_EQUAL_UINT32(0, blankOnly.monitor.p1SessionHoldMs(blankOnly.input.now));
 }
 
 void test_intervention_and_contact_loss_preserve_episode_latches()
@@ -209,7 +312,7 @@ void test_intervention_and_contact_loss_preserve_episode_latches()
     TEST_ASSERT_TRUE(f.monitor.shortAvailable());
 }
 
-void test_recovery_must_be_below_ten_percent_continuously()
+void test_recovery_must_be_below_rearm_boundary_continuously()
 {
     Fixture f;
     f.initialize();
@@ -217,7 +320,7 @@ void test_recovery_must_be_below_ten_percent_continuously()
     f.input.current = 70;
     f.tick();
     f.seconds(30);
-    f.input.current = 90; // exactly 10% is not recovered
+    f.input.current = 100.0f - P1_DROP_PCT; // At the trigger boundary: not recovered.
     f.seconds(70);
     TEST_ASSERT_TRUE(f.monitor.p1Triggered());
     f.input.current = 100;
@@ -436,9 +539,7 @@ void test_fixed_session_triggers_before_seven_saved_sessions()
     f.seconds(30);
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::SESSION), static_cast<int>(f.last.p1));
     f.seconds(90);
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::SESSION), static_cast<int>(f.last.p2));
     TEST_ASSERT_EQUAL_UINT32(0, f.monitor.p1LongHoldMs(f.input.now));
-    TEST_ASSERT_EQUAL_UINT32(0, f.monitor.p2LongHoldMs(f.input.now));
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 70, f.monitor.shortReference());
 }
 
@@ -453,22 +554,20 @@ void test_session_and_adapting_short_can_trigger_together()
     f.seconds(30);
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::SHORT_AND_SESSION), static_cast<int>(f.last.p1));
     f.seconds(90);
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::SHORT_AND_SESSION), static_cast<int>(f.last.p2));
     f.seconds(180);
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 70, f.monitor.shortReference());
-    TEST_ASSERT_TRUE(f.monitor.p2Triggered()); // fixed session still shows a drop
     TEST_ASSERT_EQUAL_UINT32(300000, f.monitor.validDurationMs());
 }
 
-void test_live_short_adaptation_can_cancel_a_pending_p2()
+void test_live_short_adaptation_resets_p1_hold_but_keeps_episode()
 {
     Fixture f;
     f.seconds(60); // small initial window adapts faster than a full five minutes
     f.input.current = 70;
     f.tick();
     f.seconds(120);
-    TEST_ASSERT_FALSE(f.monitor.p2Triggered());
-    TEST_ASSERT_EQUAL_UINT32(0, f.monitor.p2ShortHoldMs(f.input.now));
+    TEST_ASSERT_TRUE(f.monitor.p1Triggered());
+    TEST_ASSERT_EQUAL_UINT32(0, f.monitor.p1ShortHoldMs(f.input.now));
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 70, f.monitor.shortReference());
 }
 
@@ -485,82 +584,6 @@ void test_new_personal_baseline_does_not_inherit_old_trigger_time()
     f.seconds(29);
     TEST_ASSERT_FALSE(f.monitor.p1Triggered());
     TEST_ASSERT_EQUAL_INT(static_cast<int>(Source::LONG_TERM), static_cast<int>(f.tick().p1));
-}
-
-void assertAllHolds(const Fixture &f, uint32_t p1, uint32_t p2)
-{
-    TEST_ASSERT_EQUAL_UINT32(p1, f.monitor.p1LongHoldMs(f.input.now));
-    TEST_ASSERT_EQUAL_UINT32(p1, f.monitor.p1SessionHoldMs(f.input.now));
-    TEST_ASSERT_EQUAL_UINT32(p1, f.monitor.p1ShortHoldMs(f.input.now));
-    TEST_ASSERT_EQUAL_UINT32(p2, f.monitor.p2LongHoldMs(f.input.now));
-    TEST_ASSERT_EQUAL_UINT32(p2, f.monitor.p2SessionHoldMs(f.input.now));
-    TEST_ASSERT_EQUAL_UINT32(p2, f.monitor.p2ShortHoldMs(f.input.now));
-}
-
-void test_p1_continues_through_p2_and_resets_only_above_p1_boundary()
-{
-    Fixture f;
-    f.initialize();
-    f.input.longTermAvailable = f.input.sessionAvailable = true;
-    f.input.longTermBaseline = f.input.sessionBaseline = 100;
-    // Keep the short reference fixed to isolate threshold/timer transitions.
-    f.input.interventionActive = true;
-    f.input.current = 95; // exactly 5%: P1 only
-    f.monitor.update(f.input);
-    f.seconds(20);
-    assertAllHolds(f, 20000, 0);
-    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
-
-    f.input.current = 90; // exactly 10%: start P2 without restarting P1
-    f.monitor.update(f.input);
-    assertAllHolds(f, 20000, 0);
-    f.seconds(9);
-    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
-    TEST_ASSERT_EQUAL_INT((int)Source::ALL, (int)f.tick().p1);
-    assertAllHolds(f, 30000, 10000);
-
-    f.seconds(109);
-    TEST_ASSERT_FALSE(f.monitor.p2Triggered());
-    TEST_ASSERT_EQUAL_INT((int)Source::ALL, (int)f.tick().p2);
-    assertAllHolds(f, 140000, 120000);
-
-    f.input.current = 92; // leaving P2 keeps the original P1 timer running
-    f.tick();
-    assertAllHolds(f, 141000, 0);
-    f.input.current = 95;
-    f.tick();
-    assertAllHolds(f, 142000, 0);
-    f.input.current = 95.1f;
-    f.tick();
-    assertAllHolds(f, 0, 0);
-    // Resetting a hold does not bypass the existing episode-recovery latch.
-    TEST_ASSERT_TRUE(f.monitor.p1Triggered());
-    TEST_ASSERT_TRUE(f.monitor.p2Triggered());
-}
-
-void test_p2_restart_does_not_borrow_time_or_reset_p1()
-{
-    Fixture f;
-    f.initialize();
-    f.input.longTermAvailable = f.input.sessionAvailable = true;
-    f.input.longTermBaseline = f.input.sessionBaseline = 100;
-    f.input.interventionActive = true; // isolate timers from short adaptation
-    f.input.current = 90;
-    f.monitor.update(f.input);
-    f.seconds(20);
-    assertAllHolds(f, 20000, 20000);
-    f.input.current = 90.1f; // just above P2, still below P1
-    f.tick();
-    assertAllHolds(f, 21000, 0);
-    f.seconds(9);
-    TEST_ASSERT_EQUAL_INT((int)Source::ALL, (int)f.last.p1);
-    f.input.current = 90;
-    f.tick();
-    assertAllHolds(f, 31000, 0);
-    f.seconds(119);
-    TEST_ASSERT_FALSE(f.monitor.p2Triggered());
-    TEST_ASSERT_EQUAL_INT((int)Source::ALL, (int)f.tick().p2);
-    assertAllHolds(f, 151000, 120000);
 }
 
 void test_short_adapts_to_trends_but_retains_quality_gates()
@@ -589,24 +612,265 @@ void test_short_adapts_to_trends_but_retains_quality_gates()
     TEST_ASSERT_EQUAL_STRING("MOTION", collectionGateName(f.monitor.collectionGate()));
 }
 
+
+void triggerSession(Fixture &f)
+{
+    f.input.sessionAvailable = true;
+    f.input.sessionBaseline = 100;
+    f.input.current = 100.0f - P1_DROP_PCT;
+    f.tick();
+    f.seconds(30);
+    TEST_ASSERT_EQUAL_INT((int)Source::SESSION, (int)f.last.p1);
+    // P1 detection alone does not start the breathing delay.  Runtime haptic
+    // completion explicitly arms it after the five-second P1 pattern.
+    TEST_ASSERT_EQUAL_INT((int)FollowUp::IDLE, (int)f.monitor.followUp());
+}
+
+void completeInitialP1AndArmFollowUp(Fixture &f)
+{
+    f.monitor.armFollowUpCountdown(f.input.now);
+    TEST_ASSERT_EQUAL_INT((int)FollowUp::PENDING, (int)f.monitor.followUp());
+}
+
+void test_threshold_boundary_for_all_three_paths()
+{
+    Fixture f;
+    f.initialize();
+    f.input.longTermAvailable = f.input.sessionAvailable = true;
+    f.input.longTermBaseline = f.input.sessionBaseline = 100;
+    f.input.interventionActive = true; // Freeze short adaptation, not eligibility.
+    f.input.current = 100.0f - P1_DROP_PCT + 0.1f;
+    f.seconds(40);
+    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
+    f.input.current = 100.0f - P1_DROP_PCT;
+    f.tick();
+    f.seconds(29);
+    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
+    TEST_ASSERT_EQUAL_INT((int)Source::ALL, (int)f.tick().p1);
+}
+
+void test_follow_up_at_exact_five_seconds_once_despite_active_flutter()
+{
+    Fixture f;
+    triggerSession(f);
+    completeInitialP1AndArmFollowUp(f);
+    const uint32_t triggered = f.input.now;
+    f.input.interventionActive = true;
+    f.input.stable = false; // Neither is a trigger eligibility check.
+    for (unsigned ms = 10; ms <= 6000; ms += 10)
+    {
+        f.input.now = triggered + ms;
+        if (ms % 1000 == 0) f.monitor.update(f.input);
+        auto event = f.monitor.pollFollowUp(f.input);
+        TEST_ASSERT_EQUAL_INT((int)(ms == 5000 ? FollowUpEvent::START : FollowUpEvent::NONE), (int)event);
+    }
+    TEST_ASSERT_EQUAL_INT((int)FollowUp::ISSUED, (int)f.monitor.followUp());
+    f.seconds(180);
+    TEST_ASSERT_TRUE(f.monitor.p1Triggered());
+    TEST_ASSERT_EQUAL_INT((int)Source::NONE, (int)f.last.p1);
+    TEST_ASSERT_EQUAL_INT((int)FollowUpEvent::NONE, (int)f.monitor.pollFollowUp(f.input));
+}
+
+void test_signal_or_activity_does_not_cancel_follow_up_before_deadline()
+{
+    for (unsigned failure = 0; failure < 6; ++failure)
+    {
+        Fixture f;
+        triggerSession(f);
+        completeInitialP1AndArmFollowUp(f);
+        f.input.interventionActive = true;
+        f.seconds(2);
+        f.input.now += 10;
+        switch (failure)
+        {
+        case 0: f.input.signalGood = false; break;
+        case 1: f.input.current = NAN; break;
+        case 2: f.input.motion = Motion::MODERATE_MOTION; break;
+        case 3: f.input.motion = Motion::HIGH_MOTION; break;
+        case 4: f.monitor.interruptContinuity(); break;
+        case 5: f.monitor.contactChanged(); break;
+        }
+        // A triggered intervention owns its delay.  Physiological changes,
+        // report continuity, and contact state must not cancel it.
+        TEST_ASSERT_EQUAL_INT((int)FollowUpEvent::NONE, (int)f.monitor.pollFollowUp(f.input));
+        f.input.current = 90; f.input.signalGood = true;
+        f.input.motion = Motion::LOW_MOTION; f.input.sessionAvailable = true;
+        f.seconds(3);
+        TEST_ASSERT_EQUAL_INT((int)FollowUpEvent::START, (int)f.monitor.pollFollowUp(f.input));
+        TEST_ASSERT_EQUAL_INT((int)FollowUp::ISSUED, (int)f.monitor.followUp());
+        TEST_ASSERT_TRUE(f.monitor.p1Triggered());
+        TEST_ASSERT_EQUAL_INT((int)Source::NONE, (int)f.last.p1);
+    }
+}
+
+void test_deviation_recovery_does_not_cancel_or_restart_follow_up()
+{
+    Fixture f;
+    triggerSession(f);
+    completeInitialP1AndArmFollowUp(f);
+    const uint32_t triggered = f.input.now;
+    f.seconds(2);
+    f.input.current = 100;
+    f.tick();
+    TEST_ASSERT_EQUAL_INT((int)FollowUpEvent::NONE, (int)f.monitor.pollFollowUp(f.input));
+    TEST_ASSERT_EQUAL_INT((int)FollowUp::PENDING, (int)f.monitor.followUp());
+    f.tick();
+    TEST_ASSERT_EQUAL_INT((int)FollowUpEvent::NONE, (int)f.monitor.pollFollowUp(f.input));
+    f.tick();
+    TEST_ASSERT_EQUAL_UINT32(triggered + P1_FOLLOW_UP_DELAY_MS, f.input.now);
+    TEST_ASSERT_EQUAL_INT((int)FollowUpEvent::START, (int)f.monitor.pollFollowUp(f.input));
+    TEST_ASSERT_EQUAL_INT((int)FollowUpEvent::NONE, (int)f.monitor.pollFollowUp(f.input));
+}
+
+void test_reference_changes_do_not_cancel_follow_up_after_trigger()
+{
+    Fixture f;
+    triggerSession(f);
+    completeInitialP1AndArmFollowUp(f);
+    for (unsigned i = 0; i < 5; ++i)
+    {
+        f.input.current = 120;
+        f.input.sessionAvailable = false;
+        f.input.longTermAvailable = (i & 1U) != 0;
+        f.input.longTermBaseline = 80 + i;
+        f.tick();
+        TEST_ASSERT_EQUAL_INT((int)(i == 4 ? FollowUpEvent::START : FollowUpEvent::NONE),
+                              (int)f.monitor.pollFollowUp(f.input));
+    }
+}
+
+void test_follow_up_starts_across_unobserved_gap_and_wraps_millis()
+{
+    Fixture f;
+    triggerSession(f);
+    completeInitialP1AndArmFollowUp(f);
+    f.input.now += 5000;
+    TEST_ASSERT_EQUAL_INT((int)FollowUpEvent::START, (int)f.monitor.pollFollowUp(f.input));
+    Fixture wrap;
+    wrap.input.now = UINT32_MAX - 34000;
+    triggerSession(wrap);
+    completeInitialP1AndArmFollowUp(wrap);
+    for (unsigned i = 0; i < 5; ++i)
+    {
+        wrap.tick();
+        auto event = wrap.monitor.pollFollowUp(wrap.input);
+        TEST_ASSERT_EQUAL_INT((int)(i == 4 ? FollowUpEvent::START : FollowUpEvent::NONE), (int)event);
+    }
+}
+
+void test_completed_episode_rearms_after_counter_reset_and_retriggers()
+{
+    Fixture f;
+    triggerSession(f); // First independent 30-second physiological event.
+    TEST_ASSERT_TRUE(f.monitor.p1Triggered());
+
+    // P1 playback has completed, then the 5-second delay emits exactly one
+    // follow-up start.  The counter may reset while that intervention runs.
+    completeInitialP1AndArmFollowUp(f);
+    f.seconds(5);
+    TEST_ASSERT_EQUAL_INT((int)FollowUpEvent::START, (int)f.monitor.pollFollowUp(f.input));
+    f.input.current = 100.0f;
+    f.tick();
+    TEST_ASSERT_TRUE(f.monitor.p1Triggered()); // Do not clear mid-intervention.
+
+    // Runtime reports completion only after the 12-second breathing stage
+    // stops.  Since all persistence holds are now zero, the next monitor
+    // update completely rearms P1 for a new episode.
+    f.monitor.completeP1Intervention();
+    TEST_ASSERT_TRUE(f.tick().resumed);
+    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
+    TEST_ASSERT_EQUAL_INT((int)Source::NONE, (int)f.monitor.p1Source());
+    TEST_ASSERT_EQUAL_INT((int)FollowUp::IDLE, (int)f.monitor.followUp());
+
+    // A second independent 30-second event must be emitted normally.
+    f.input.current = 100.0f - P1_DROP_PCT;
+    f.tick();
+    f.seconds(30);
+    TEST_ASSERT_TRUE(f.last.p1 != Source::NONE);
+    TEST_ASSERT_TRUE(f.monitor.p1Triggered());
+
+    // Repeat once more to prove state does not accumulate a permanent latch.
+    f.input.current = 100.0f;
+    f.tick();
+    f.monitor.completeP1Intervention();
+    TEST_ASSERT_TRUE(f.tick().resumed);
+    f.input.current = 100.0f - P1_DROP_PCT;
+    f.tick();
+    f.seconds(30);
+    TEST_ASSERT_TRUE(f.last.p1 != Source::NONE);
+}
+
+void test_completed_follow_up_immediately_starts_fresh_p1_hold()
+{
+    Fixture f;
+    triggerSession(f);
+    TEST_ASSERT_TRUE(f.monitor.p1Triggered());
+    TEST_ASSERT_TRUE(f.monitor.p1SessionHoldMs(f.input.now) >= P1_HOLD_MS);
+
+    // The successful 12-second follow-up ends the episode even though DEV
+    // remains at the P1 threshold. No previous hold time may carry over.
+    f.monitor.completeP1FollowUp();
+    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
+    TEST_ASSERT_EQUAL_INT((int)Source::NONE, (int)f.monitor.p1Source());
+    TEST_ASSERT_EQUAL_INT((int)FollowUp::IDLE, (int)f.monitor.followUp());
+    TEST_ASSERT_EQUAL_UINT32(0, f.monitor.p1SessionHoldMs(f.input.now));
+
+    f.tick();
+    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
+    TEST_ASSERT_EQUAL_UINT32(0, f.monitor.p1SessionHoldMs(f.input.now));
+    f.seconds(29);
+    TEST_ASSERT_FALSE(f.monitor.p1Triggered());
+    TEST_ASSERT_EQUAL_INT((int)Source::SESSION, (int)f.tick().p1);
+}
+
+void test_motor_fault_blocked_playback_requires_existing_recovery_before_new_trigger()
+{
+    Fixture f;
+    triggerSession(f);
+    completeInitialP1AndArmFollowUp(f);
+    // This is the same operation main.cpp uses when a motor fault blocks
+    // playback.  It cancels only the haptic follow-up, not the P1 episode.
+    f.monitor.cancelFollowUp();
+    TEST_ASSERT_EQUAL_INT((int)FollowUpEvent::CANCELLED, (int)f.monitor.pollFollowUp(f.input));
+    f.input.current = 100;
+    f.seconds(60);
+    TEST_ASSERT_TRUE(f.monitor.p1Triggered());
+    TEST_ASSERT_TRUE(f.tick().resumed);
+    TEST_ASSERT_EQUAL_INT((int)FollowUp::IDLE, (int)f.monitor.followUp());
+    f.input.current = 100.0f - P1_DROP_PCT; f.tick(); f.seconds(30);
+    TEST_ASSERT_TRUE(f.last.p1 != Source::NONE);
+    TEST_ASSERT_EQUAL_INT((int)FollowUp::IDLE, (int)f.monitor.followUp());
+}
+
 int main()
 {
     UNITY_BEGIN();
+    RUN_TEST(test_threshold_boundary_for_all_three_paths);
+    RUN_TEST(test_follow_up_at_exact_five_seconds_once_despite_active_flutter);
+    RUN_TEST(test_signal_or_activity_does_not_cancel_follow_up_before_deadline);
+    RUN_TEST(test_deviation_recovery_does_not_cancel_or_restart_follow_up);
+    RUN_TEST(test_reference_changes_do_not_cancel_follow_up_after_trigger);
+    RUN_TEST(test_follow_up_starts_across_unobserved_gap_and_wraps_millis);
+    RUN_TEST(test_completed_episode_rearms_after_counter_reset_and_retriggers);
+    RUN_TEST(test_completed_follow_up_immediately_starts_fresh_p1_hold);
+    RUN_TEST(test_motor_fault_blocked_playback_requires_existing_recovery_before_new_trigger);
     RUN_TEST(test_short_adapts_to_trends_but_retains_quality_gates);
-    RUN_TEST(test_p1_continues_through_p2_and_resets_only_above_p1_boundary);
-    RUN_TEST(test_p2_restart_does_not_borrow_time_or_reset_p1);
     RUN_TEST(test_requires_one_minute_and_prefers_five);
     RUN_TEST(test_median_uses_middle_pair_and_resists_outlier);
     RUN_TEST(test_partial_or_bad_quality_blocks_do_not_count);
     RUN_TEST(test_old_readings_expire_in_wall_time);
-    RUN_TEST(test_ten_percent_drop_triggers_p1_at_the_configured_five_percent_threshold);
-    RUN_TEST(test_both_paths_trigger_at_30_and_120_seconds);
+    RUN_TEST(test_configured_drop_triggers_p1_after_30_seconds);
+    RUN_TEST(test_both_paths_trigger_once_after_30_seconds);
     RUN_TEST(test_short_path_does_not_require_long_term_baseline);
     RUN_TEST(test_long_term_path_does_not_require_short_reference);
     RUN_TEST(test_source_timers_cannot_borrow_elapsed_time);
-    RUN_TEST(test_invalid_input_and_report_gaps_break_continuous_timers);
+    RUN_TEST(test_moderate_motion_continues_running_p1_hold_but_high_motion_resets_it);
+    RUN_TEST(test_blank_dev_bridges_running_p1_hold_but_report_gaps_still_reset);
+    RUN_TEST(test_running_p1_hold_bridges_up_to_ten_blank_dev_samples);
+    RUN_TEST(test_valid_below_threshold_after_blank_dev_resets_p1_hold);
+    RUN_TEST(test_eleventh_consecutive_blank_dev_resets_and_blank_cannot_start_p1_hold);
     RUN_TEST(test_intervention_and_contact_loss_preserve_episode_latches);
-    RUN_TEST(test_recovery_must_be_below_ten_percent_continuously);
+    RUN_TEST(test_recovery_must_be_below_rearm_boundary_continuously);
     RUN_TEST(test_motion_requires_one_minute_of_continuous_low);
     RUN_TEST(test_startup_motion_does_not_start_recovery_before_resting_data);
     RUN_TEST(test_timers_and_sample_expiry_survive_millis_rollover);
@@ -618,7 +882,7 @@ int main()
     RUN_TEST(test_recovery_low_time_handles_rollover_and_ignores_report_gaps);
     RUN_TEST(test_fixed_session_triggers_before_seven_saved_sessions);
     RUN_TEST(test_session_and_adapting_short_can_trigger_together);
-    RUN_TEST(test_live_short_adaptation_can_cancel_a_pending_p2);
+    RUN_TEST(test_live_short_adaptation_resets_p1_hold_but_keeps_episode);
     RUN_TEST(test_new_personal_baseline_does_not_inherit_old_trigger_time);
     return UNITY_END();
 }

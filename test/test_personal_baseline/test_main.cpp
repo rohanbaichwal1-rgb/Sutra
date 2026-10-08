@@ -193,7 +193,7 @@ void test_personal_path_waits_for_seven_while_short_works_without_session()
         if (t == 331000)
             TEST_ASSERT_EQUAL_INT(static_cast<int>(rmssd::Source::SHORT_TERM), static_cast<int>(events.p1));
     }
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(rmssd::Source::SHORT_TERM), static_cast<int>(events.p2));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(rmssd::Source::SHORT_TERM), static_cast<int>(monitor.p1Source()));
     TEST_ASSERT_EQUAL_UINT32(0, monitor.p1LongHoldMs(in.now));
     TEST_ASSERT_TRUE(h.saveSession(100));
     rmssd::Monitor nextBoot;
@@ -213,7 +213,7 @@ void test_personal_path_waits_for_seven_while_short_works_without_session()
         if (t == 331000)
             TEST_ASSERT_EQUAL_INT(static_cast<int>(rmssd::Source::BOTH), static_cast<int>(events.p1));
     }
-    TEST_ASSERT_EQUAL_INT(static_cast<int>(rmssd::Source::BOTH), static_cast<int>(events.p2));
+    TEST_ASSERT_EQUAL_INT(static_cast<int>(rmssd::Source::BOTH), static_cast<int>(nextBoot.p1Source()));
 }
 
 void test_session_freezes_and_saves_its_own_median_while_short_adapts()

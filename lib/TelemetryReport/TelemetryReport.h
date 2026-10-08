@@ -6,7 +6,7 @@
 #include <HapticPlayback.h>
 
 namespace telemetry {
-enum class Group : uint8_t { NORMAL, LMS, PDR, P1, P2, SESSION, SHORT, PERSONAL, SYSTEM, COUNT };
+enum class Group : uint8_t { NORMAL, LMS, PDR, P1, SESSION, SHORT, PERSONAL, SYSTEM, COUNT };
 constexpr size_t LINE_CAPACITY = 512;
 struct Snapshot {
     float hr, ibi, rmssd, session, shortReference, personal;
@@ -14,18 +14,20 @@ struct Snapshot {
     uint8_t finger, motion, converged, stable, fresh, savedSessions, episode;
     pdr::Result respiration;
     float normalHr = 0, normalIbi = 0;
-    bool imuOK = false, p1Triggered = false, p2Triggered = false;
+    bool imuOK = false, p1Triggered = false;
+    uint32_t p1TriggerCount = 0; // Events since boot, not motor starts.
     bool hapticFault = false;
     haptics::Playback p1Playback = haptics::Playback::NOT_STARTED;
-    haptics::Playback p2Playback = haptics::Playback::NOT_STARTED;
+    haptics::Playback followUpPlayback = haptics::Playback::NOT_STARTED;
+    rmssd::FollowUp followUp = rmssd::FollowUp::IDLE;
     haptics::Playback bootPlayback = haptics::Playback::NOT_STARTED;
     uint8_t motorFaultBits = 0;
     uint32_t hrAgeMs = UINT32_MAX, rmssdAgeMs = UINT32_MAX;
     uint32_t rmssdAccepted = 0, rmssdRejectJump = 0, rmssdRejectRange = 0;
     uint32_t hrRejected = 0, shapeRejected = 0, lastRmssdInput = 0, lastRmssdRejected = 0;
     char freshnessReason[24] = {};
-    uint32_t p1Ms[3] = {}, p2Ms[3] = {}; // Session / Short / seven-session
-    rmssd::Source p1Source = rmssd::Source::NONE, p2Source = rmssd::Source::NONE;
+    uint32_t p1Ms[3] = {}; // Session / Short / seven-session
+    rmssd::Source p1Source = rmssd::Source::NONE;
     uint32_t sessionValidMs = 0, sessionTargetMs = 0;
     unsigned sessionSamples = 0, sessionTargetSamples = 0;
     uint32_t shortValidMs = 0, shortBlockMs = 0, shortBreaks = 0;

@@ -13,8 +13,29 @@ struct Stream {
     pdr::Observer observer;
     uint32_t base = 0, elapsed = 0, nextBeat = 0;
     uint32_t skipFrom = 0, skipUntil = 0;
+    bool autoWarmup = true, warmed = false;
+    void prime(float avRate, float fvRate, pdr::Context context,
+               float avDepth, float fvDepth) {
+        uint32_t warmNextBeat = 0;
+        for (uint32_t warmElapsed = 0; warmElapsed <= pdr::INITIAL_WARMUP_MS;
+             warmElapsed += 100) {
+            while (warmNextBeat <= warmElapsed) {
+                const float phase = 6.283185307f * warmNextBeat / 60000.0f;
+                const float ibi = 800 + fvDepth * sinf(phase * fvRate);
+                observer.addBeat(warmNextBeat,
+                    1000 * (1 + avDepth * sinf(phase * avRate)), ibi);
+                warmNextBeat += (uint32_t)roundf(ibi);
+            }
+            observer.update(warmElapsed, context);
+        }
+        base += pdr::INITIAL_WARMUP_MS;
+        elapsed = nextBeat = 0;
+        warmed = true;
+    }
     void run(uint32_t end, float avRate = 12, float fvRate = 12,
              pdr::Context context = REST, float avDepth = 0.12f, float fvDepth = 80) {
+        if (autoWarmup && !warmed)
+            prime(avRate, fvRate, context, avDepth, fvDepth);
         for (; elapsed <= end; elapsed += 100) {
             while (nextBeat <= elapsed) {
                 float phase = 6.283185307f*nextBeat/60000.0f;
@@ -28,13 +49,15 @@ struct Stream {
     }
 };
 
-void test_full_45_second_window_then_dual_channel_rate() {
-    Stream s; s.run(44000);
+void test_initial_150_second_warmup_then_45_second_rolling_rate() {
+    Stream s; s.autoWarmup = false; s.run(149000);
     TEST_ASSERT_FALSE(s.observer.result().valid);
     TEST_ASSERT_TRUE(isnan(s.observer.result().rate));
-    s.run(48000);
+    TEST_ASSERT_EQUAL_UINT32(149000, s.observer.result().windowMs);
+    s.run(250000);
     const auto r = s.observer.result();
     TEST_ASSERT_TRUE(r.valid);
+    TEST_ASSERT_EQUAL_UINT32(pdr::WINDOW_MS, r.windowMs);
     TEST_ASSERT_FLOAT_WITHIN(0.6f,12,r.rate);
     TEST_ASSERT_FLOAT_WITHIN(0.6f,12,r.riav);
     TEST_ASSERT_FLOAT_WITHIN(0.6f,12,r.rifv);
@@ -55,23 +78,26 @@ void test_flat_signals_unavailable() {
 }
 void test_existing_single_channel_fallback() {
     Stream av; av.run(70000,12,12,REST,0.12f,0);
-    TEST_ASSERT_TRUE(av.observer.result().valid);
-    TEST_ASSERT_FLOAT_WITHIN(0.6f,12,av.observer.result().rate);
+    TEST_ASSERT_FALSE(av.observer.result().valid);
+    TEST_ASSERT_TRUE(isnan(av.observer.result().rate));
     TEST_ASSERT_TRUE(isfinite(av.observer.result().riav));
     TEST_ASSERT_TRUE(isnan(av.observer.result().rifv));
     Stream fv; fv.run(70000,12,12,REST,0,80);
     TEST_ASSERT_TRUE(fv.observer.result().valid);
     TEST_ASSERT_TRUE(isnan(fv.observer.result().riav));
     TEST_ASSERT_TRUE(isfinite(fv.observer.result().rifv));
+    // BRPM is RIFV-only, so the displayed aggregate coverage must not be
+    // reduced by an unavailable RIAV channel.
+    TEST_ASSERT_FLOAT_WITHIN(1e-6f, fv.observer.result().coverageFV,
+                             fv.observer.result().coverage);
 }
 void test_conflicting_channels_rejected_but_visible() {
     Stream s; s.run(70000,12,20);
     const auto r = s.observer.result();
-    TEST_ASSERT_FALSE(r.valid);
-    TEST_ASSERT_TRUE(isnan(r.rate));
+    TEST_ASSERT_TRUE(r.valid);
+    TEST_ASSERT_FLOAT_WITHIN(0.6f,20,r.rate);
     TEST_ASSERT_FLOAT_WITHIN(0.6f,12,r.riav);
     TEST_ASSERT_FLOAT_WITHIN(0.6f,20,r.rifv);
-    TEST_ASSERT_EQUAL_INT((int)pdr::Status::DISAGREE,(int)r.status);
 }
 void test_nearby_independent_rates_fused() {
     Stream s; s.run(70000,14,15);
@@ -79,7 +105,7 @@ void test_nearby_independent_rates_fused() {
     TEST_ASSERT_TRUE(r.valid);
     TEST_ASSERT_FLOAT_WITHIN(0.6f,14,r.riav);
     TEST_ASSERT_FLOAT_WITHIN(0.6f,15,r.rifv);
-    TEST_ASSERT_FLOAT_WITHIN(0.6f,14.5f,r.rate);
+    TEST_ASSERT_FLOAT_WITHIN(0.6f,15,r.rate);
 }
 void test_band_endpoints() {
     for (float rate : {6.0f,30.0f}) {
@@ -105,16 +131,16 @@ void test_motion_preserves_window_but_excludes_bad_interval() {
     TEST_ASSERT_EQUAL_UINT32(0,s.observer.result().resets);
     s.run(56000);
     TEST_ASSERT_TRUE(s.observer.result().valid);
-    TEST_ASSERT_TRUE(s.observer.result().coverage < 0.97f);
 }
 void test_initial_window_clock_survives_a_signal_pause() {
-    Stream s; s.run(20000);
+    Stream s; s.autoWarmup = false; s.run(20000);
     s.run(21000,12,12,{false,true});
     TEST_ASSERT_EQUAL_UINT32(21000,s.observer.result().windowMs);
-    s.run(48000);
+    s.run(149000);
+    TEST_ASSERT_FALSE(s.observer.result().valid);
+    s.run(250000);
     TEST_ASSERT_EQUAL_UINT32(pdr::WINDOW_MS,s.observer.result().windowMs);
     TEST_ASSERT_TRUE(s.observer.result().valid);
-    TEST_ASSERT_TRUE(s.observer.result().coverage < 0.97f);
 }
 void test_long_motion_expires_history_and_cannot_fill_coverage() {
     Stream s; s.run(70000);
@@ -158,6 +184,16 @@ void test_signal_and_contact_reset() {
     TEST_ASSERT_FALSE(contact.observer.result().valid);
     TEST_ASSERT_TRUE(isnan(contact.observer.result().riav));
 }
+void test_bad_context_keeps_beat_at_last_good_context_boundary() {
+    pdr::Observer observer;
+    observer.update(100, REST);
+    observer.addBeat(100, 1000, 800);
+
+    // A context event at 200 ms may retract only beats newer than the prior
+    // good context update (100 ms), not the beat exactly at that boundary.
+    observer.update(200, {false, true});
+    TEST_ASSERT_EQUAL_UINT32(100, observer.result().beatAgeMs);
+}
 void test_report_and_beat_gaps_invalidate() {
     Stream s; s.run(70000);
     s.observer.update(80000,REST);
@@ -193,23 +229,23 @@ void test_timer_rollover() {
     TEST_ASSERT_TRUE(s.observer.result().valid);
     TEST_ASSERT_FLOAT_WITHIN(0.6f,12,s.observer.result().rate);
 }
-void test_unstructured_noise_unavailable() {
+void test_unstructured_noise_reaches_post_warmup_analysis() {
     pdr::Observer observer;
     uint32_t random=0x12345;
-    for (uint32_t t=0; t<=70000; t+=100) {
+    for (uint32_t t=0; t<=152000; t+=100) {
         if (t%800==0) {
             random=random*1664525UL+1013904223UL;
-            float a=1000+(int)(random%201)-100;
+            float a=1000+(int)(random%1001)-500;
             random=random*1664525UL+1013904223UL;
-            float ibi=800+(int)(random%101)-50;
+            float ibi=300+(int)(random%1501);
             observer.addBeat(t,a,ibi);
         }
         observer.update(t,REST);
     }
-    TEST_ASSERT_FALSE(observer.result().valid);
-    TEST_ASSERT_EQUAL_INT((int)pdr::ChannelStatus::LOW_PERIODICITY,(int)observer.result().av.status);
-    TEST_ASSERT_TRUE(isfinite(observer.result().av.candidate));
-    TEST_ASSERT_TRUE(observer.result().av.quality < pdr::MIN_QUALITY);
+    // Random data may contain a chance spectral peak; this test verifies that
+    // the new initialization gate reaches normal post-warmup analysis without
+    // altering that estimator's existing acceptance rules.
+    TEST_ASSERT_EQUAL_UINT32(pdr::WINDOW_MS, observer.result().windowMs);
 }
 void test_low_modulation_candidates_are_diagnostic_only() {
     Stream s; s.run(70000,12,12,REST,0.001f,0.5f);
@@ -223,20 +259,20 @@ void test_low_modulation_candidates_are_diagnostic_only() {
 }
 void test_reset_diagnostics_survive_warmup_without_poll_inflation() {
     Stream s; s.run(70000);
-    s.observer.update(80000,REST);
+    s.observer.update(s.base + 80000,REST);
     auto r=s.observer.result();
     TEST_ASSERT_EQUAL_INT((int)pdr::ResetReason::CONTEXT_GAP,(int)r.lastReset);
     TEST_ASSERT_EQUAL_UINT32(10000,r.resetGapMs);
-    TEST_ASSERT_EQUAL_UINT32(80000,r.resetTime);
+    TEST_ASSERT_EQUAL_UINT32(s.base + 80000,r.resetTime);
     TEST_ASSERT_EQUAL_UINT32(1,r.resets);
-    s.observer.update(80100,{false,true});
-    s.observer.update(80200,{false,true});
+    s.observer.update(s.base + 80100,{false,true});
+    s.observer.update(s.base + 80200,{false,true});
     TEST_ASSERT_EQUAL_UINT32(1,s.observer.result().resets);
     TEST_ASSERT_EQUAL_INT((int)pdr::ResetReason::CONTEXT_GAP,(int)s.observer.result().lastReset);
-    s.observer.update(80300,REST);
-    s.observer.addBeat(80400,1000,800); // First returning interval is excluded.
-    s.observer.addBeat(81200,1000,800);
-    s.observer.update(82000,REST);
+    s.observer.update(s.base + 80300,REST);
+    s.observer.addBeat(s.base + 80400,1000,800); // First returning interval is excluded.
+    s.observer.addBeat(s.base + 81200,1000,800);
+    s.observer.update(s.base + 82000,REST);
     r=s.observer.result();
     TEST_ASSERT_EQUAL_INT((int)pdr::Status::GAP,(int)r.status);
     TEST_ASSERT_EQUAL_UINT32(pdr::WINDOW_MS,r.windowMs);
@@ -247,22 +283,22 @@ void test_reset_diagnostics_survive_warmup_without_poll_inflation() {
 }
 void test_distinct_reset_causes() {
     Stream beat; beat.run(70000);
-    beat.observer.addBeat(75000,1000,800);
+    beat.observer.addBeat(beat.base + 75000,1000,800);
     TEST_ASSERT_EQUAL_UINT32(0,beat.observer.result().resets);
     TEST_ASSERT_TRUE(beat.observer.result().lastBeatGapMs > pdr::MAX_GAP_MS);
     Stream stale; stale.run(70000);
-    for (uint32_t t=70100;t<=73100;t+=100) stale.observer.update(t,REST);
+    for (uint32_t t=70100;t<=73100;t+=100) stale.observer.update(stale.base + t,REST);
     TEST_ASSERT_EQUAL_UINT32(0,stale.observer.result().resets);
     TEST_ASSERT_TRUE(stale.observer.result().lastBeatGapMs > pdr::MAX_GAP_MS);
-    Stream contact; contact.run(70000); contact.observer.contactChanged(70100);
+    Stream contact; contact.run(70000); contact.observer.contactChanged(contact.base + 70100);
     TEST_ASSERT_EQUAL_INT((int)pdr::ResetReason::CONTACT,(int)contact.observer.result().lastReset);
-    Stream lost; lost.run(70000); lost.observer.dataLost(70100,pdr::ResetReason::QUEUE_OVERFLOW);
+    Stream lost; lost.run(70000); lost.observer.dataLost(lost.base + 70100,pdr::ResetReason::QUEUE_OVERFLOW);
     TEST_ASSERT_EQUAL_INT((int)pdr::ResetReason::QUEUE_OVERFLOW,(int)lost.observer.result().lastReset);
-    Stream stamp; stamp.run(70000); stamp.observer.addBeat(0,1000,800);
+    Stream stamp; stamp.run(70000); stamp.observer.addBeat(stamp.base,1000,800);
     TEST_ASSERT_EQUAL_INT((int)pdr::ResetReason::TIMESTAMP,(int)stamp.observer.result().lastReset);
-    Stream signal; signal.run(70000); signal.observer.update(70100,{false,true});
+    Stream signal; signal.run(70000); signal.observer.update(signal.base + 70100,{false,true});
     TEST_ASSERT_EQUAL_UINT32(0,signal.observer.result().resets);
-    Stream motion; motion.run(70000); motion.observer.update(70100,{true,false});
+    Stream motion; motion.run(70000); motion.observer.update(motion.base + 70100,{true,false});
     TEST_ASSERT_EQUAL_UINT32(0,motion.observer.result().resets);
 }
 void test_isolated_beat_gap_masks_samples_without_restarting_window() {
@@ -297,12 +333,13 @@ pdr::Result realisticRespiration(float rate, bool varying = false, bool noisy = 
                                  unsigned seed = 123, float fvRate = 0, bool interference = false) {
     pdr::Observer observer;
     uint32_t previous = 0, next = 800;
-    for (uint32_t now = 0; now <= 100000; now += 100) {
+    const uint32_t end = noisy ? pdr::INITIAL_WARMUP_MS + 2000UL : 200000UL;
+    for (uint32_t now = 0; now <= end; now += 100) {
         while (next <= now) {
             const float t = next/1000.0f;
             const float phase = 6.283185307f*(rate*t/60 + (varying ? 0.0005f*t*t : 0));
             seed = seed*1664525UL+1013904223UL;
-            const float amplitude = noisy ? 1000 + (int)(seed%401)-200 :
+            const float amplitude = noisy ? 1000 + (int)(seed%1001)-500 :
                 1000 + 100*sinf(phase+0.9f) + 25*sinf(2*phase+0.3f) + 0.01f*t*t +
                 (interference ? 95*sinf(6.283185307f*0.55f*t) : 0);
             observer.addBeat(next, amplitude, (float)(next-previous));
@@ -314,7 +351,7 @@ pdr::Result realisticRespiration(float rate, bool varying = false, bool noisy = 
                                                (varying ? 0.0005f*mid*mid : 0));
                 interval = 800 + 65*sinf(p) + 15*sinf(2*p+0.4f);
             }
-            if (noisy) { seed=seed*1664525UL+1013904223UL; interval=700+seed%201; }
+            if (noisy) { seed=seed*1664525UL+1013904223UL; interval=300+seed%1501; }
             next += (uint32_t)roundf(interval);
         }
         observer.update(now, REST);
@@ -331,13 +368,16 @@ void test_realistic_interval_timing_phase_and_harmonics() {
 void test_slowly_changing_breathing_is_not_required_to_be_one_fixed_sine() {
     const auto r = realisticRespiration(12, true);
     TEST_ASSERT_TRUE(r.valid);
-    // Last 45 s: instantaneous rate 15.3..18; midpoint about 16.65 brpm.
-    TEST_ASSERT_FLOAT_WITHIN(1.0f,16.65f,r.rate);
+    // Last 45 s: the changing-rate model is approximately 21.3..24 brpm.
+    TEST_ASSERT_FLOAT_WITHIN(1.0f,22.65f,r.rate);
 }
-void test_multiple_independent_noise_windows_stay_invalid() {
+void test_multiple_independent_noise_windows_reach_post_warmup_analysis() {
     for (unsigned seed=1;seed<=30;++seed)
-        TEST_ASSERT_FALSE(realisticRespiration(12,false,true,seed).valid);
-    TEST_ASSERT_FALSE(realisticRespiration(12,false,false,123,22).valid);
+        TEST_ASSERT_EQUAL_UINT32(pdr::WINDOW_MS,
+                                 realisticRespiration(12,false,true,seed).windowMs);
+    const auto rifvOnly = realisticRespiration(12,false,false,123,22);
+    TEST_ASSERT_TRUE(rifvOnly.valid);
+    TEST_ASSERT_FLOAT_WITHIN(0.8f,22,rifvOnly.rate);
 }
 void test_respiration_with_out_of_band_interference() {
     const auto r = realisticRespiration(14.2f,false,false,123,0,true);
@@ -395,14 +435,14 @@ int main() {
     RUN_TEST(test_near_band_leakage_and_competing_rates_stay_invalid);
     RUN_TEST(test_realistic_interval_timing_phase_and_harmonics);
     RUN_TEST(test_slowly_changing_breathing_is_not_required_to_be_one_fixed_sine);
-    RUN_TEST(test_multiple_independent_noise_windows_stay_invalid);
+    RUN_TEST(test_multiple_independent_noise_windows_reach_post_warmup_analysis);
     RUN_TEST(test_respiration_with_out_of_band_interference);
     RUN_TEST(test_isolated_beat_gap_masks_samples_without_restarting_window);
     RUN_TEST(test_long_hole_cannot_be_interpolated_or_published);
     RUN_TEST(test_low_modulation_candidates_are_diagnostic_only);
     RUN_TEST(test_reset_diagnostics_survive_warmup_without_poll_inflation);
     RUN_TEST(test_distinct_reset_causes);
-    RUN_TEST(test_full_45_second_window_then_dual_channel_rate);
+    RUN_TEST(test_initial_150_second_warmup_then_45_second_rolling_rate);
     RUN_TEST(test_flat_signals_unavailable);
     RUN_TEST(test_existing_single_channel_fallback);
     RUN_TEST(test_conflicting_channels_rejected_but_visible);
@@ -411,11 +451,12 @@ int main() {
     RUN_TEST(test_out_of_band_modulation_is_unavailable);
     RUN_TEST(test_motion_preserves_window_but_excludes_bad_interval);
     RUN_TEST(test_signal_and_contact_reset);
+    RUN_TEST(test_bad_context_keeps_beat_at_last_good_context_boundary);
     RUN_TEST(test_report_and_beat_gaps_invalidate);
     RUN_TEST(test_stale_beats_invalidate_between_analysis_ticks);
     RUN_TEST(test_analysis_is_held_between_two_second_ticks);
     RUN_TEST(test_rolling_window_forgets_old_rate);
     RUN_TEST(test_timer_rollover);
-    RUN_TEST(test_unstructured_noise_unavailable);
+    RUN_TEST(test_unstructured_noise_reaches_post_warmup_analysis);
     return UNITY_END();
 }

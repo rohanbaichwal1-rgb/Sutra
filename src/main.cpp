@@ -1794,7 +1794,7 @@ void updateBaseline(uint32_t nowMs)
 }
 
 // ============================================================
-// PHASE-1 PoC: LOCAL P1 / P2 TRIGGERS + HAPTIC ACTUATION
+// PHASE-1 PoC: P1 TRIGGER + TWO-STAGE HAPTIC INTERVENTION
 //
 // Session, live short-term, and seven-session personal references have independent timers.
 // LONG_TERM is enabled only after seven completed sessions are saved in NVS.
@@ -1809,13 +1809,18 @@ const uint32_t HAPTIC_FRAME_INTERVAL_MS = 10UL;
 const uint32_t HAPTIC_FAULT_POLL_MS = 100UL;
 const uint32_t HAPTIC_STOP_RETRY_MS = 250UL;
 
+// Per-boot trigger totals, independent of motor playback success and recovery.
+uint32_t p1TriggerCount = 0;
+
 HapticWireBus hapticBus(Wire);
-haptics::ArrayConfig singleMotorHapticConfig()
+haptics::ArrayConfig threeMotorHapticConfig()
 {
     haptics::ArrayConfig config;
-    config.motorCount = 1;
+    config.motorCount = haptics::MOTOR_COUNT;
     config.channels[0] = 0;
-    config.outputScalePercent = 20; // Map the original 0..100% envelope to 0..40%.
+    config.channels[1] = 1;
+    config.channels[2] = 2;
+    config.outputScalePercent = 100; // Preserve the reference DA7280 pattern values.
     return config;
 }
 haptics::ArrayConfig threeMotorBootCheckConfig()
@@ -1825,14 +1830,15 @@ haptics::ArrayConfig threeMotorBootCheckConfig()
     config.channels[0] = 0;
     config.channels[1] = 1;
     config.channels[2] = 2;
-    config.outputScalePercent = 20;
+    config.outputScalePercent = 100;
     return config;
 }
-haptics::ArrayConfig hapticArrayConfig = singleMotorHapticConfig();
+haptics::ArrayConfig hapticArrayConfig = threeMotorHapticConfig();
 haptics::Array hapticArray(hapticBus, hapticArrayConfig);
 haptics::ArrayConfig bootCheckArrayConfig = threeMotorBootCheckConfig();
 haptics::Array bootCheckArray(hapticBus, bootCheckArrayConfig);
 haptics::Patterns hapticPatterns;
+haptics::PlaybackLog hapticPlayback;
 bool hapticPatternActive = false;
 bool hapticFaultReported = false;
 uint8_t reportedHapticWarnings = 0;
@@ -1846,8 +1852,8 @@ const char *getHapticStateName()
         return hapticArray.outputStopPending() ? "FAULT_STOP_PENDING" : "FAULT";
     if (hapticPatterns.protocol() == haptics::Protocol::P1_FLUTTER)
         return "P1_FLUTTER";
-    if (hapticPatterns.protocol() == haptics::Protocol::P2_SWEEP)
-        return "P2_SWEEP";
+    if (hapticPatterns.protocol() == haptics::Protocol::P1_FOLLOW_UP)
+        return "P1_FOLLOW_UP";
     return "OFF";
 }
 
@@ -1891,6 +1897,8 @@ void updateHapticActuator(uint32_t nowMs)
 {
     if (!hapticArray.ready())
     {
+        hapticPlayback.finished(false);
+        referenceMonitor.cancelFollowUp();
         hapticPatterns.stop();
         if (hapticArray.shutdownPending() &&
             nowMs - lastHapticStopRetryMs >= HAPTIC_STOP_RETRY_MS)
@@ -1907,47 +1915,63 @@ void updateHapticActuator(uint32_t nowMs)
         return;
     lastHapticFrameMs = nowMs;
 
+    const haptics::Protocol playing = hapticPatterns.protocol();
     const haptics::Frame &frame = hapticPatterns.update(nowMs);
     if (!hapticPatterns.active())
+{
+    const bool stopped = hapticArray.stopAll();
+    hapticPlayback.finished(stopped);
+
+    if (stopped)
     {
-        if (hapticArray.stopAll())
-            Serial.println("[HAPTIC] protocol complete");
+        if (playing == haptics::Protocol::P1_FLUTTER)
+        {
+            // 5-second P1 vibration completed.
+            // Now begin the 5-second delay before follow-up.
+            referenceMonitor.armFollowUpCountdown(nowMs);
+
+            Serial.println(
+                "[P1] initial vibration completed; FOLLOW_UP countdown started");
+        }
+        else if (playing == haptics::Protocol::P1_FOLLOW_UP)
+        {
+            // Full 12-second follow-up completed.
+            referenceMonitor.completeP1FollowUp();
+
+            Serial.println("[P1] FOLLOW_UP completed");
+        }
     }
+}
     else if (!hapticArray.apply(frame))
         hapticPatterns.stop();
 
-    if (hapticPatterns.active() && nowMs - lastHapticFaultPollMs >= HAPTIC_FAULT_POLL_MS)
-    {
-        lastHapticFaultPollMs = nowMs;
-        if (!hapticArray.pollFaults())
-            hapticPatterns.stop();
-    }
     hapticPatternActive = hapticPatterns.active() || hapticArray.outputStopPending();
+    if (!hapticArray.ready())
+    {
+        hapticPlayback.finished(false);
+        referenceMonitor.cancelFollowUp();
+    }
     reportHapticFault();
 }
 
-void startHapticProtocol(haptics::Protocol protocol, uint32_t nowMs)
+bool startHapticProtocol(haptics::Protocol protocol, uint32_t nowMs)
 {
     if (!hapticArray.ready())
     {
         Serial.println("[HAPTIC] trigger received; driver array unavailable");
-        return;
+        hapticPlayback.failedRequest(protocol);
+        return false;
     }
     if (protocol == haptics::Protocol::P1_FLUTTER &&
-        hapticPatterns.protocol() == haptics::Protocol::P2_SWEEP)
-        return; // P2 retains priority
+        hapticPatterns.active())
+        return false; // Never overlap/restart an intervention.
 
-    if (!hapticArray.pollFaults() || !hapticArray.stopAll())
-    {
-        hapticPatterns.stop();
-        hapticPatternActive = hapticArray.outputStopPending();
-        reportHapticFault();
-        return;
-    }
-    // Fresh hardware seed for each flutter. P2 replaces P1 immediately.
-    nowMs = millis(); // Start the envelope after the preparation transfers.
-    bool started = protocol == haptics::Protocol::P2_SWEEP
-                       ? hapticPatterns.startP2(nowMs)
+    // Match the working sketches: start the requested pattern and apply its
+    // first frame directly. The pattern lifecycle already guarantees P1 has
+    // stopped before its follow-up is started.
+    nowMs = millis();
+    bool started = protocol == haptics::Protocol::P1_FOLLOW_UP
+                       ? hapticPatterns.startFollowUp(nowMs)
                        : hapticPatterns.startP1(nowMs, esp_random());
     if (started && !hapticArray.apply(hapticPatterns.frame()))
         hapticPatterns.stop();
@@ -1955,20 +1979,27 @@ void startHapticProtocol(haptics::Protocol protocol, uint32_t nowMs)
     hapticPatternActive = hapticPatterns.active() || hapticArray.outputStopPending();
     if (hapticPatterns.active())
     {
-        Serial.print("[HAPTIC] started ");
+        hapticPlayback.started(protocol);
+        Serial.print(protocol == haptics::Protocol::P1_FOLLOW_UP
+                         ? "[P1] FOLLOW_UP started | " : "[P1] initial vibration started | ");
         Serial.print(getHapticStateName());
         Serial.print(" | Duration:");
         Serial.print(hapticPatterns.durationMs() / 1000UL);
         Serial.println("s");
     }
+    else
+        hapticPlayback.failedRequest(protocol);
     reportHapticFault();
+    return hapticPatterns.active();
 }
 
-// Startup-only hardware check. It deliberately uses a separate three-motor
-// array so normal P1/P2 playback remains on the configured single motor.
+// Startup-only hardware check. It uses the former P2 pacing waveform (now the
+// P1 follow-up pattern), routed through the existing startup motor configuration.
 void runStartupMotorCheck()
 {
-    Serial.println("[HAPTIC] BOOT_TEST: all three motors for 10s at 40%; confirm by touch");
+    Serial.printf("[HAPTIC] BOOT_TEST: P1 follow-up pacing on all three motors for %lus at %u%% scale; confirm by touch\n",
+                  (unsigned long)(haptics::BREATH_CYCLE_MS / 1000UL),
+                  (unsigned)bootCheckArrayConfig.outputScalePercent);
     if (!bootCheckArray.begin())
     {
         Serial.print("[HAPTIC] BOOT_TEST failed to initialize | Motor:");
@@ -1980,21 +2011,19 @@ void runStartupMotorCheck()
 
     haptics::Patterns bootPattern;
     const uint32_t startedMs = millis();
-    bool ok = bootPattern.startBootTest(startedMs) &&
+    bool ok = bootPattern.startFollowUp(startedMs) &&
               bootCheckArray.apply(bootPattern.frame());
-    uint32_t lastFaultPollMs = startedMs;
-
     while (ok && bootPattern.active())
     {
         const uint32_t nowMs = millis();
-        bootPattern.update(nowMs);
+        const haptics::Frame &frame = bootPattern.update(nowMs);
         if (!bootPattern.active())
             break;
-        if (nowMs - lastFaultPollMs >= HAPTIC_FAULT_POLL_MS)
-        {
-            lastFaultPollMs = nowMs;
-            ok = bootCheckArray.pollFaults();
-        }
+        // Array::apply() changes only channels whose frame values changed,
+        // so this updates every ramp without disrupting another active motor.
+        ok = bootCheckArray.apply(frame);
+        if (!ok)
+            break;
         delay(1);
     }
 
@@ -2020,40 +2049,64 @@ bool isReferenceInputFresh(uint32_t nowMs)
     return nowMs - rmssdBuf[newest].tMs < STALE_RESEED_MS;
 }
 
-void updateStressTriggers(uint32_t nowMs)
+rmssd::Input referenceInput(uint32_t nowMs)
 {
-    rmssd::Input input = {
+    // A failed driver can remain stop-pending while it protects the motor.
+    // That hardware cleanup state is not a physiological intervention and
+    // must not hold P1's detection or recovery state open.  A healthy,
+    // actively playing pattern retains the existing collection/rearm block.
+    const bool physiologicalInterventionActive =
+        hapticArray.ready() && hapticPatternActive;
+    return {
         nowMs,
         currentRMSSD,
         isReferenceInputFresh(nowMs) && latestAccelOK && latestGyroOK,
         getReferenceMotion(),
         isRmssdStableGate(),
-        hapticPatternActive,
+        physiologicalInterventionActive,
         personalBaseline.ready(),
         personalBaseline.baseline(),
         sessionCollector.complete(),
         sessionCollector.median()};
-    rmssd::Events events = referenceMonitor.update(input);
+}
+
+void updateP1FollowUp(uint32_t nowMs)
+{
+    if (!referenceMonitor.followUpNeedsPolling()) return;
+    if (!hapticArray.ready()) referenceMonitor.cancelFollowUp();
+    const auto event = referenceMonitor.pollFollowUp(referenceInput(nowMs));
+    if (event == rmssd::FollowUpEvent::CANCELLED)
+        Serial.println("[P1] FOLLOW_UP cancelled for this trigger (signal/activity interruption or motor fault)");
+    else if (event == rmssd::FollowUpEvent::START)
+    {
+        if (!startHapticProtocol(haptics::Protocol::P1_FOLLOW_UP, nowMs))
+            Serial.println("[P1] FOLLOW_UP failed to start; no retry for this trigger");
+    }
+}
+
+void updateStressTriggers(uint32_t nowMs)
+{
+    rmssd::Events events = referenceMonitor.update(referenceInput(nowMs));
 
     if (events.resumed)
-        Serial.println("[P1/P2] recovery complete - triggers rearmed");
+    {
+        // Playback outcomes describe one completed P1 episode.  The monitor
+        // owns the physiological rearm decision; do not carry a previous
+        // motor failure into the next eligible episode or alter TriggerCount.
+        hapticPlayback = haptics::PlaybackLog{};
+        Serial.println("[P1] recovery complete - trigger rearmed");
+    }
 
     if (events.p1 != rmssd::Source::NONE)
     {
+        ++p1TriggerCount; // Count the event once, not the latched Triggered state.
         Serial.print("[P1] TRIGGERED | TriggerSource:");
         Serial.print(rmssd::sourceName(events.p1));
-        Serial.println(" | LongTermBasis:SEVEN_SESSIONS");
-    }
-    if (events.p2 != rmssd::Source::NONE)
-    {
-        Serial.print("[P2] TRIGGERED | TriggerSource:");
-        Serial.print(rmssd::sourceName(events.p2));
-        Serial.println(" | LongTermBasis:SEVEN_SESSIONS");
-        startHapticProtocol(haptics::Protocol::P2_SWEEP, nowMs);
-    }
-    else if (events.p1 != rmssd::Source::NONE)
-    {
-        startHapticProtocol(haptics::Protocol::P1_FLUTTER, nowMs);
+        Serial.print(" | LongTermBasis:SEVEN_SESSIONS | TriggerCount:");
+        Serial.println(p1TriggerCount);
+        hapticPlayback = haptics::PlaybackLog{};
+        if (!startHapticProtocol(haptics::Protocol::P1_FLUTTER, nowMs))
+            referenceMonitor.cancelFollowUp();
     }
 }
 
@@ -2120,7 +2173,9 @@ void setup()
     // Sensor initialization continues if the haptic array is absent/faulty.
     Serial.println("[Startup] Checking haptic mux/drivers...");
     if (hapticArray.begin())
-        Serial.println("[HAPTIC] 1 x DA7280 ready | M1:CH0 | P1:5s P2:10s | Intensity range:0-40%");
+        Serial.printf("[HAPTIC] 3 x DA7280 ready | M1:CH0 M2:CH1 M3:CH2 | P1:5s Follow-up:%lus | Intensity scale:%u%%\n",
+                      (unsigned long)(haptics::BREATH_CYCLE_MS / 1000UL),
+                      (unsigned)hapticArrayConfig.outputScalePercent);
     else
         reportHapticFault();
     hapticPatternActive = hapticArray.outputStopPending();
@@ -2375,16 +2430,17 @@ void loop()
 
     uint32_t nowMs = millis();
 
-    // A brief invalid period between reports must break continuous holds.
+    // Keep an already-running P1 hold alive long enough for the monitor to
+    // apply its bounded blank-DEV tolerance at the next report.
     if (!isReferenceInputFresh(nowMs) || !latestAccelOK || !latestGyroOK)
     {
-        referenceMonitor.interruptContinuity();
+        referenceMonitor.interruptSignalContinuity();
         sessionCollector.interrupt();
     }
 
     // Independent observer. Its output is never passed to the RMSSD monitor.
     pdrService::context(nowMs, {fingerPresent&& latestAccelOK && latestGyroOK,
-                                motionState == MOTION_LOW});
+                                motionState != MOTION_HIGH});
 
     if (nowMs - rateWindowStartMs >= 1000)
     {
@@ -2420,6 +2476,8 @@ void loop()
         updateRmssdStability(nowMs);
         updateStressTriggers(nowMs);
         updateBaseline(nowMs);
+        // Check the deadline only AFTER any newly due RMSSD/eligibility update.
+        updateP1FollowUp(millis());
 
         const bool lmsValid = isLmsHRValid();
         const bool normalValid = isReferenceHRValid();
@@ -2440,8 +2498,12 @@ void loop()
         snapshot.fresh = fresh;
         snapshot.savedSessions = personalBaseline.count();
         snapshot.p1Triggered = referenceMonitor.p1Triggered();
-        snapshot.p2Triggered = referenceMonitor.p2Triggered();
-        snapshot.episode = snapshot.p2Triggered ? 2 : snapshot.p1Triggered ? 1 : 0;
+        snapshot.p1TriggerCount = p1TriggerCount;
+        snapshot.episode = snapshot.p1Triggered ? 1 : 0;
+        snapshot.followUp = referenceMonitor.followUp();
+        snapshot.p1Playback = hapticPlayback.state(haptics::Protocol::P1_FLUTTER);
+        snapshot.followUpPlayback = hapticPlayback.state(haptics::Protocol::P1_FOLLOW_UP);
+        snapshot.hapticFault = !hapticArray.ready();
         snapshot.respiration = pdrService::read(nowMs);
         snapshot.normalHr = normalValid ? currentBPM : NAN;
         snapshot.normalIbi = normalValid && currentIBI > 0 ? currentIBI : NAN;
@@ -2449,11 +2511,7 @@ void loop()
         snapshot.p1Ms[0] = referenceMonitor.p1SessionHoldMs(nowMs);
         snapshot.p1Ms[1] = referenceMonitor.p1ShortHoldMs(nowMs);
         snapshot.p1Ms[2] = referenceMonitor.p1LongHoldMs(nowMs);
-        snapshot.p2Ms[0] = referenceMonitor.p2SessionHoldMs(nowMs);
-        snapshot.p2Ms[1] = referenceMonitor.p2ShortHoldMs(nowMs);
-        snapshot.p2Ms[2] = referenceMonitor.p2LongHoldMs(nowMs);
         snapshot.p1Source = referenceMonitor.p1Source();
-        snapshot.p2Source = referenceMonitor.p2Source();
         snapshot.sessionValidMs = sessionCollector.validDurationMs();
         snapshot.sessionTargetMs = personal::SESSION_DURATION_MS;
         snapshot.sessionSamples = sessionCollector.sampleCount();
@@ -2628,6 +2686,8 @@ void loop()
 
         tsLastReport = nowMs;
     }
+    // Nonblocking loop-cadence check, not a one-second report-cadence timer.
+    updateP1FollowUp(millis());
 }
 
 // ============================================================
