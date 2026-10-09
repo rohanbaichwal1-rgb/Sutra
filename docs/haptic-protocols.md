@@ -1,40 +1,20 @@
 # Haptic actuation
 
-The PoC uses one RMSSD P1 trigger. The initial flutter lasts five seconds.
-A nonblocking five-second delay starts at the trigger timestamp. At five seconds,
-stop the initial output and start the P1 follow-up sweep once. It retains the
-existing ten-second breathing cycle. RMSSD recovery or reference changes during
-the delay do not cancel it; signal/contact/activity failures and timing or motor
-faults do. Recovery/rearm remains unchanged.
+The PoC uses one RMSSD P1 trigger with two haptic stages. The initial flutter
+lasts five seconds. Once it has completed and all motors are stopped, a
+nonblocking five-second delay is armed. The P1 follow-up then runs once for
+twelve seconds. It is not an independent P2 trigger.
 
 ## Current hardware scope
 
-The pattern library and transport are designed for up to three logical motors,
-but the checked-in firmware currently enables **one** SmartElex DA7280 module:
-Motor 1 on TCA9548A channel 0. The left/centre/right descriptions below document
-the three-channel pattern design and its host tests; they are not a claim that
-the production configuration currently drives channels 1 and 2. With the current
-`motorCount = 1` configuration, only Motor 1 portions of both P1 stages are sent.
+The runtime configuration enables three SmartElex DA7280 modules. Motor 1,
+Motor 2, and Motor 3 use TCA9548A channels 0, 1, and 2 respectively. There is
+no output scaling: `outputScalePercent = 100`, so the direct DA7280 values in
+the supplied reference patterns are preserved.
 
-Adding the remaining modules requires wiring them to distinct mux channels and
-changing the firmware configuration deliberately. It is not enabled merely by
-using the three-motor pattern generator.
-
-The P1 RMSSD drop threshold is 10%, with a 30-second trigger hold. There is no
-independent second trigger or threshold. These playback durations include
-the existing pattern's quiet intervals. The reusable pattern generator supports
-independent P1 taps across all three positions and the follow-up left/right/centre sweep
-below. The currently enabled single module receives only its Motor 1 frames.
-
-The unchanged single-motor firmware sets `ArrayConfig::outputScalePercent = 20`.
-It scales the original 0–100% envelope into 0–20%, preserving ramps and pauses
-instead of forcing a fixed ON intensity. P1's original 90% taps become 18%;
-the follow-up's 10–50% ramps become 2–10%, its 60% hold becomes 12%, and its 30–0%
-exhale becomes 6–0%. The original envelopes are described below.
-Percentages are converted to raw 0–127 DRO codes with rounding: a 20% full-scale
-command is code 25, not the reference sketch's raw code 40. Phase timing, fault
-handling and motor electrical settings are unchanged. The library default of
-100 preserves the original envelope; 0 mutes it.
+The P1 RMSSD drop threshold is 15%, with a 30-second trigger hold. There is no
+independent second trigger or threshold. Both P1 stages update all three motor
+frames when their levels change.
 
 ## Hardware mapping
 
@@ -44,73 +24,58 @@ The MAX30101 and BMI270 remain on that root bus. The TCA9548A address is `0x70`.
 | Logical motor | Position | Mux channel | DA7280 address | Enabled now |
 |---|---|---|---|---|
 | Motor 1 | Left | 0 | `0x4A` | Yes |
-| Motor 2 | Center / P6 | 1 | `0x4A` | No — design/test mapping |
-| Motor 3 | Right | 2 | `0x4A` | No — design/test mapping |
+| Motor 2 | Center / P6 | 1 | `0x4A` | Yes |
+| Motor 3 | Right | 2 | `0x4A` | Yes |
 
-The driver selects exactly one channel for each addressed motor, checks I2C
-results, and deselects all channels before returning to the sensor code. Each
-DA7280 continues its amplitude independently after deselection, allowing both
-outer motors to run during exhale. These are three separate driver modules;
-the mux does not provide motor power or directly drive an LRA.
+The driver selects one mux channel per DA7280 transfer and deselects all channels
+before returning to sensor traffic. A configured DA7280 retains its output after
+the mux changes channel, allowing M1 and M3 to run together. The mux does not
+provide motor power or directly drive an LRA.
 
-This setup targets the onboard LRA of the supplied SmartElex module. It retains
-the existing/default DA7280 actuator voltage, current, impedance, and frequency
-registers; the SmartElex manual does not publish a motor-specific replacement
-profile. It does not substitute SparkFun's `defaultMotor()` values. This is not
-a calibration of the attached motors. If the onboard motors have been replaced,
-their electrical parameters must be configured from the replacement datasheet.
+Haptic transactions run at 100 kHz; the adapter restores the 400 kHz sensor bus
+speed after each transaction. Each driver uses the register equivalent of the
+reference sketch's `defaultMotor()`, `enableFreqTrack(false)`, `DRO_MODE`, and
+`setVibrate(0)` setup. Frequency tracking is disabled and frame values are
+converted to DA7280's 0-127 DRO code range without an additional scale factor.
 
-Amplitude is sent through DA7280 direct-register-override mode, with LRA BEMF
-sensing, frequency tracking, acceleration, and rapid stopping enabled. The
-0–100% envelope is mapped to the supported nonnegative 0–127 command range.
-Percentages describe commanded amplitude relative to the configured driver
-full scale, not measured mechanical strength. Driver supply-limit warnings are
-reported because delivered strength can be lower than requested.
+## P1: randomized flutter
 
-## P1: chaotic staccato flutter
-
-- 90% amplitude on each motor's active taps.
-- Each motor has its own staggered start and independent tap/gap timer.
-- Nominal tap lengths vary from 60 to 250 ms; gaps vary from 50 to 450 ms.
-- Taps may overlap across motors, without a common periodic beat.
-- A fresh ESP32 random seed is used for each five-second intervention.
-- All outputs stop at completion. A final tap is shortened only if it can still
-  meet the 60 ms minimum; otherwise that tap is omitted.
+- Duration: 5 seconds.
+- One motor is active at direct DRO value 60 for each 200 ms slot.
+- Each group of three slots contains M1, M2, and M3 exactly once in a new random
+  order.
+- There is no intentional gap between slots.
+- All motors stop at completion.
 
 ## P1 follow-up: resonant pacing sweep
 
 | Time within each cycle | Motor 1 | Motor 2 | Motor 3 |
 |---|---|---|---|
-| 0–1.3 s | 10% → 50% | Off | Off |
-| 1.3–2.6 s | Off | Off | 10% → 50% |
-| 2.6–4.0 s | Off | 60% | Off |
-| 4.0–6.0 s | Off | 60% → 30% | Off |
-| 6.0–10.0 s | 30% → 0% | Off | 30% → 0% |
+| 0-3 s | ramp 5 -> 45 | Off | ramp 5 -> 45 |
+| 3-4 s | Off | 50 | Off |
+| 4-5 s | Off | Off | Off |
+| 5-7 s | Off | ramp 50 -> 25 | Off |
+| 7-12 s | ramp 25 -> 0 | Off | ramp 25 -> 0 |
 
-Ramps are linear in commanded amplitude. Cycle timing is derived from elapsed
-time, so late loop calls do not accumulate breathing-cycle drift. The firmware
-services envelopes about every 10 ms and also between serial report lines.
-I2C transfers and loop scheduling introduce timing/quantization error; this is
-not a hardware-timed waveform generator. The left/center/right mounting produces
-the intended spatial cue; individual LRAs are not commanded to move physically
-toward or away from P6.
+Ramps are linear in direct DRO command values. Cycle timing is derived from
+elapsed time, so late loop calls do not accumulate drift. The firmware services
+envelopes about every 10 ms. I2C transfers and loop scheduling introduce timing
+quantization; this is not a hardware-timed waveform generator.
 
 ## Runtime status and faults
 
 ```mermaid
 flowchart TD
-    Trigger[RMSSD P1 event] --> P1[Start 5 s flutter and nonblocking delay]
-    P1 --> Delay[Wait 5 s from P1 trigger]
-    Delay --> Follow[Confirm stop; start follow-up sweep once]
-    Delay -. signal/contact/activity/gap/motor fault .-> Cancel[Cancel follow-up for this trigger]
-    P1 --> Frame[Service envelope every about 10 ms]
+    Trigger[RMSSD P1 event] --> P1[Start 5 s flutter]
+    P1 --> Stop[Stop all motors]
+    Stop --> Delay[Arm 5 s follow-up delay]
+    Delay --> Follow[Start 12 s follow-up once]
+    P1 --> Frame[Service changed frame values every about 10 ms]
     Follow --> Frame
-    Frame --> Poll[Poll DA7280 faults every 100 ms]
-    Poll --> OK{I2C and driver healthy?}
-    OK -- Yes --> Done{Pattern complete?}
+    Frame --> Done{Pattern complete?}
     Done -- No --> Frame
-    Done -- Yes --> Stop[Write zero amplitude and inactive mode]
-    OK -- No --> Fault[Stop all configured channels; latch fault]
+    Done -- Yes --> Stop
+    Frame -. I2C failure .-> Fault[Stop all configured channels]
     Fault --> Retry[Retry uncertain stop every 250 ms]
 ```
 
@@ -118,26 +83,26 @@ The transport uses TCA9548A channel selection to address one identical-address
 DA7280 at a time. A previously addressed driver keeps its amplitude after mux
 disconnect, so multi-motor envelopes can overlap when configured.
 
-Before sensor initialization, startup runs `BOOT_TEST`: all three logical motors
-on mux channels 0–2 receive the configured startup intensity for three seconds. Confirm each
-motor physically by touch. The test uses a separate three-motor array; normal
-Both P1 stages remain configured for Motor 1 only. If a test branch is missing
-or faults, the failure is logged and sensor initialization continues.
+Before sensor initialization, startup runs `BOOT_TEST`: the complete 12-second
+follow-up waveform is played through all three motors. Confirm each motor and
+ramp by touch. The test uses a separate three-motor array. If a test branch is
+missing or faults, the failure is logged and sensor initialization continues.
 
-While a protocol is playing, frames are serviced about every 10 ms and driver
-fault registers are polled every 100 ms. At normal completion the firmware sends
-a stop command and logs P1 initial/follow-up completion. I2C failures and driver
-faults stop the sequence; shutdown is retried every 250 ms if its acknowledgement
-is uncertain. `FAULT_STOP_PENDING` means the firmware cannot yet confirm a stop.
+While a protocol is playing, changed frames are serviced about every 10 ms.
+At normal completion the firmware sends a stop command and logs P1 initial or
+follow-up completion. I2C failures stop the sequence; shutdown is retried every
+250 ms if its acknowledgement is uncertain. `Array::pollFaults()` remains
+available for diagnostics and host tests but is not run as a pre-start or
+periodic runtime sweep.
+`FAULT_STOP_PENDING` means the firmware cannot yet confirm a stop.
 Haptic state is reported as `OFF`, `P1_FLUTTER`, `P1_FOLLOW_UP`, `FAULT`, or
 `FAULT_STOP_PENDING`.
 
-The follow-up replaces a still-running flutter only after a successful hardware
-stop. New initial requests cannot interrupt active patterns. Serial reports P1
-trigger, follow-up start/cancellation/completion; the P1 telemetry line includes
-both playback outcomes and follow-up scheduling state. Reference collection/recovery sees
-the whole intervention as active, including P1 gaps. Haptics remain disabled
-after a latched driver fault until reboot. Software can confirm commands and I2C
+The follow-up begins only after a successful stop of the flutter. New initial
+requests cannot interrupt an active pattern. Serial reports P1 trigger and
+follow-up start/cancellation/completion; the P1 telemetry line includes both
+playback outcomes and follow-up scheduling state. Haptics remain disabled after
+a latched driver fault until reboot. Software can confirm commands and I2C
 acknowledgements, not physical vibration; confirm motor response by touch. The
 I2C transfer timeout is bounded at 10 ms.
 

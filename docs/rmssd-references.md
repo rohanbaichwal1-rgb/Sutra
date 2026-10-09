@@ -20,17 +20,15 @@ flowchart TD
     Gate -- No --> Reject[Exclude from RMSSD/PDR]
     Gate -- Yes --> Window[60 s RMSSD window]
     Window --> RMSSD[sqrt(mean(successive IBI difference squared))]
-    RMSSD --> Quality{Fresh signal, valid IMU,<br/>LOW motion, no post-exercise wait?}
-    Quality -- No --> Pause[Break holds / cancel pending follow-up]
+    RMSSD --> Quality{Fresh signal, valid IMU,<br/>not HIGH motion, no post-exercise wait?}
+    Quality -- No --> Pause[Break or pause holds]
     Quality -- Yes --> Refs[Compare session, short, and personal references]
-    Refs --> P1{Drop >=10% for 30 s?}
-    P1 -- Yes --> P1Fire[Trigger P1: flutter and 5 s delay]
+    Refs --> P1{Drop >=15% for 30 s?}
+    P1 -- Yes --> P1Fire[Trigger P1: 5 s flutter]
     P1 -- No --> Refs
-    P1Fire --> Follow[Wait 5 s from P1 trigger]
-    Follow --> Sweep[Stop flutter; start 10 s follow-up once]
-    Follow -. signal/contact/activity/gap fault .-> Cancel[Cancel follow-up for this trigger]
-    Sweep --> Rearm[60 s stable recovery below 10% drop]
-    Cancel --> Rearm
+    P1Fire --> Follow[After flutter, wait 5 s]
+    Follow --> Sweep[Run 12 s follow-up once]
+    Sweep --> Rearm[Reset episode and begin a fresh hold if needed]
 ```
 
 ## Current session and saved sessions
@@ -85,8 +83,8 @@ Fresh valid LMS-HR/RMSSD and successful IMU reads are still required. A positive
 reference is needed for percentage comparisons.
 
 The short reference adapts through pending triggers and episode recovery whenever
-signal/motion quality gates pass. There is no preliminary 10% freeze or frozen short
-snapshot. Active haptics, invalid/stale data, non-LOW motion and
+signal/motion quality gates pass. There is no preliminary threshold freeze or frozen short
+snapshot. Active haptics, invalid/stale data, and non-LOW motion
 post-exercise recovery pause collection. Readings keep expiring during pauses,
 so `ShortValid` can decrease. Contact changes clear the short buffer but retain
 episode latches, the completed session baseline and saved history.
@@ -101,43 +99,44 @@ HIGH motion starts/restarts a 60-second LOW-motion recovery requirement after
 recovery is armed by the first qualifying resting block. Startup motion before
 that block does not start post-exercise recovery. MODERATE never starts or resets
 this wait; it pauses the countdown and preserves accrued LOW time. LOW resumes
-it. Unobserved time does not count. Both MODERATE and HIGH interrupt collection
-blocks and P1 continuous holds, and cancel a pending follow-up.
+it. Unobserved time does not count. Both MODERATE and HIGH interrupt baseline
+collection blocks. MODERATE does not pause or reset P1 persistence counting;
+HIGH resets P1 holds. Once armed, a pending follow-up is not cancelled by later
+physiological input.
 
 ## P1 logic
 
-Each available reference has its own continuous 30-second hold at a drop of
-at least 10%. Equality qualifies: a 100 ms baseline requires RMSSD <=90 ms.
+Each available reference has its own 30-second hold at a drop of at least 15%.
+Equality qualifies: a 100 ms baseline requires RMSSD <=85 ms.
 There is one trigger and one boot-lifetime trigger counter, not a second stress
 threshold/timer. Both vibration stages belong to that same P1 trigger.
 
-One completed path suffices; elapsed time cannot transfer between paths. Invalid
-input, non-LOW motion or post-exercise recovery breaks holds. RMSSD stability is
+One completed path suffices; elapsed time cannot transfer between paths. HIGH
+motion or post-exercise recovery breaks holds. An already-running hold tolerates
+up to ten consecutive blank DEV reports; blank DEV cannot start a hold, and a
+returning valid DEV below threshold resets it. RMSSD stability is
 required for fixed session collection and episode recovery, but not for short
 adaptation or timing a drop. P1 fires once per episode.
 
-P1 starts the existing five-second flutter immediately. A nonblocking five-second
-delay starts at the trigger timestamp, not the first motor write. Once scheduled,
-the follow-up does not depend on the RMSSD deviation, reference availability, or
-baseline changes during that delay. Signal/contact/activity failures permanently
-cancel follow-up for that trigger. Unobserved gaps over the existing 2.5-second
-limit cancel too.
-The motor-active collection gate alone does not cancel follow-up; actual invalid
-sensor readings or disqualifying motion during vibration do.
+P1 starts the five-second flutter immediately. After the flutter has completed
+and the motors have stopped successfully, the runtime arms a nonblocking
+five-second delay. The 12-second follow-up starts once after that delay. Once
+armed, it does not depend on later RMSSD deviation, references, signal state, or
+motion state. A haptic execution failure can cancel it; it is not retried.
 
-At five seconds, hardware is confirmed stopped before the unchanged ten-second P1
-follow-up sweep starts once. It is not retried on hardware failure.
-Cancellation does not clear the episode latch. After follow-up starts, it runs
-to completion unless a hardware fault stops it. PDR does not gate either stage.
+After the 12-second follow-up completes, the P1 latch, source, follow-up state,
+recovery latch, and all P1 holds are reset. If DEV remains above threshold, it
+must build a fresh 30-second hold. `TriggerCount` remains cumulative. PDR does
+not gate either stage.
 
 Sources identify `SESSION`, `SHORT_TERM`, `LONG_TERM`, or explicit combinations
 such as `SESSION+SHORT_TERM`. `LONG_TERM` means the seven-session personal value,
 not the individual current-session baseline.
 
-After an episode, rearm after 60 continuous seconds of stable, qualified recovery
-with less than 10% drop against every available reference, at least one reference
-available, and no active intervention. Exactly 10% does not qualify. The short
-reference continues adapting during recovery when quality permits.
+The normal completed-follow-up path rearms immediately by resetting the episode.
+The legacy recovery path is retained only for a fired episode whose runtime caller
+does not report intervention completion; it requires 60 seconds of stable,
+qualified recovery below 15% drop against all available references.
 
 ## Serial and BLE output
 
@@ -181,9 +180,9 @@ Short, PersonalBaseline and System. Each line includes device uptime.
   by `Triggered`, `Source`, playback/action, `FollowUp`, `FollowUpPlayback`, and
   `TriggerCount`. Unavailable reference paths show `--`.
 - `System` includes `PostExercise` with remaining LOW time and `PAUSED` on MODERATE.
-  `Rearm:0/60s` appears only after a trigger until recovery completes. Rearming
-  needs 60 seconds of stable, qualified data below 10% drop against all available
-  references, with no active haptics. This is separate from post-exercise recovery.
+  `Rearm:0/60s` appears only while the legacy recovery path is active. A normally
+  completed follow-up clears the episode immediately. This is separate from
+  post-exercise recovery.
 
 BLE group UUIDs and notification setup: [ble-telemetry.md](ble-telemetry.md).
 

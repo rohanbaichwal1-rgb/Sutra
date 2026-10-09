@@ -67,10 +67,17 @@ Example (illustrative values):
 ```
 
 `--` means unavailable; booleans are Y/N. RMSSD deviation is positive for a drop;
-PDR is unavailable unless both RIAV and RIFV pass quality and agree. `Normal` uses
+PDR BRPM is available only when RIFV passes its existing coverage, modulation, and
+quality checks. RIAV remains a diagnostic value and does not gate or fuse into BRPM. `Normal` uses
 the existing non-LMS reference beat detector; it is separate from the LMS values
 used by the RMSSD logic. PDR is display-only with no P1/follow-up connections; see
 [pdr-observer.md](pdr-observer.md).
+
+## Enable or disable BLE
+
+Set `SUTRA_BLE_ENABLED` near the top of `src/main.cpp` to `1` or `0`, then rebuild
+and upload. With the value set to `0`, BLE initialization and publishing are
+compiled out while the same Serial telemetry remains active.
 
 Snapshots are produced about once per second, not as a lossless sample/beat log.
 Bluetooth delivery is best effort; congested connections can lose notifications,

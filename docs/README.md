@@ -12,9 +12,9 @@ stress, and PDR is context rather than a trigger.
 |---|---|---|
 | PPG and LMS beat processing | Cleans PPG with a motion-informed LMS path, detects usable beats, and calculates RMSSD. | Rejected, stale, or no-contact data cannot qualify a trigger. |
 | Three RMSSD references | Uses a startup session median, an adapting five-minute short reference, and a persisted seven-session median. | Seven startup sessions are a prototype stand-in for daily measurements. |
-| P1 episode logic | Triggers at a 10% RMSSD drop held for 30 s, then requires stable recovery before rearming. | One trigger with a conditionally scheduled follow-up; not a clinical conclusion. |
-| Haptic patterns | Generates a 5 s P1 flutter and automatically starts a 10 s follow-up sweep five seconds after the P1 trigger at the unchanged 20% output scale. | Firmware currently drives one DA7280/LRA on mux channel 0; the library is three-motor capable. |
-| PDR observer | Estimates respiratory-rate context from RIAV/RIFV for display. | It never gates, changes, or triggers either P1 stage. |
+| P1 episode logic | Triggers at a 15% RMSSD drop held for 30 s. | One trigger with a two-stage intervention; not a clinical conclusion. |
+| Haptic patterns | Generates a 5 s random three-motor flutter, then a 12 s follow-up after a 5 s post-flutter delay. | M1/M2/M3 are DA7280 drivers on TCA9548A channels 0/1/2. |
+| PDR observer | Estimates display-only respiratory-rate context from RIFV; RIAV remains diagnostic. | It never gates, changes, or triggers either P1 stage. |
 | BLE telemetry | Provides grouped UTF-8 read fields plus a notification stream that mirrors serial output. | Notifications are best effort, not a beat-by-beat recording. |
 
 ## System flow
@@ -28,9 +28,8 @@ flowchart LR
     Beat --> PDR[PDR observer]
     Ref --> Trigger{Sustained drop<br/>and quality gates?}
     Trigger -- P1 --> Flutter[P1: 5 s flutter]
-    Flutter --> Delay[Wait 5 s from P1 trigger]
-    Delay --> Sweep[P1 follow-up: 10 s pacing]
-    Delay -. signal/contact/activity/gap/motor fault .-> Cancel[Cancel follow-up for this trigger]
+    Flutter --> Delay[Wait 5 s after flutter completes]
+    Delay --> Sweep[P1 follow-up: 12 s pacing]
     Flutter --> Driver[DA7280 via TCA9548A]
     Sweep --> Driver
     Beat --> Report[Serial + BLE telemetry]
@@ -42,41 +41,39 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    A[Fresh RMSSD + valid IMU + LOW motion] -->|No| Stop[Pause holds and collection]
+    A[Fresh RMSSD + valid IMU + not HIGH motion] -->|No| Stop[Pause or reset as appropriate]
     A -->|Yes| B[Compare with each available reference]
-    B --> D{Drop at least 10%<br/>for 30 s?}
+    B --> D{Drop at least 15%<br/>for 30 s?}
     D -->|Yes| P1[P1 trigger and 5 s flutter]
     D -->|No| Watch[Continue monitoring]
-    P1 --> Delay[Wait 5 s from P1 trigger]
-    Delay --> Follow[Stop flutter; start follow-up once]
-    Delay -. signal/contact/activity/gap/motor fault .-> Cancel[Cancel follow-up for this trigger]
-    Follow --> Recover[Require 60 s stable recovery]
-    Cancel --> Recover
-    Recover --> Watch
+    P1 --> Flutter[Run 5 s flutter]
+    Flutter --> Delay[Wait 5 s after flutter completes]
+    Delay --> Follow[Run 12 s follow-up once]
+    Follow --> Watch[Reset P1 episode and monitor anew]
 ```
 
-Follow-up is issued once per P1 trigger. A recovered RMSSD deviation or changed
-reference does not cancel or restart the delay; signal/contact/activity, timing,
-or motor failures do.
-The initial flutter is stopped cleanly before the follow-up starts.
+Follow-up is issued once per P1 trigger. The delay begins only after the initial
+flutter stops successfully. Once armed, later RMSSD, reference, signal, or motion
+changes do not cancel or restart it; a haptic execution failure can cancel it.
 
 ## P1 follow-up pacing chart
 
-The following timeline is the three-logical-motor pattern. In the current
-single-motor hardware configuration, only the left/Motor 1 spans are actuated.
+The runtime and startup test both use all three motors.
 
 ```mermaid
 gantt
-    title One 10-second P1 follow-up breathing cycle
+    title One 12-second P1 follow-up breathing cycle
     dateFormat  X
     axisFormat %Ls
     section Left / Motor 1
-    Inhale ramp 10–50% : 0, 1300
-    Exhale ramp 30–0% : 6000, 4000
+    Inhale ramp 5 to 45 : 0, 3000
+    Exhale ramp 25 to 0 : 7000, 5000
     section Centre / Motor 2
-    Hold then ease 60–30% : 2600, 3400
+    Hold 50 : 3000, 1000
+    Ease 50 to 25 : 5000, 2000
     section Right / Motor 3
-    Inhale ramp 10–50% : 1300, 1300
+    Inhale ramp 5 to 45 : 0, 3000
+    Exhale ramp 25 to 0 : 7000, 5000
 ```
 
 ## Detailed documents
@@ -97,3 +94,6 @@ pio test -c platformio-test.ini -e native
 The host tests verify deterministic algorithms and simulated I2C behavior.
 Hardware testing is still required for sensor accuracy, vibration strength,
 timing under load, BLE performance, and safe power behavior.
+
+BLE is enabled by default. Set `SUTRA_BLE_ENABLED` to `0` near the top of
+`src/main.cpp` to build a Serial-only firmware.

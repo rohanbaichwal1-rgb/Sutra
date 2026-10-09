@@ -14,7 +14,7 @@ constexpr uint32_t MAX_GAP_MS = 2500;
 constexpr float MIN_RATE = 6.0f, MAX_RATE = 30.0f; // 0.10-0.50 Hz
 constexpr float RATE_STEP = 0.5f, MAX_DISAGREEMENT = 2.0f; // breaths/minute
 constexpr float MIN_QUALITY = 0.30f;
-constexpr float MIN_COVERAGE = 0.65f;
+constexpr float MIN_COVERAGE = 0.30f;
 constexpr float RIAV_MIN_STD = 0.005f, RIFV_MIN_STD = 0.003f;
 enum class Status : uint8_t {
     WARMUP,
