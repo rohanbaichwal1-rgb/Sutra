@@ -3,6 +3,8 @@
 #include <BLEDevice.h>
 #include <BLE2902.h>
 #include <atomic>
+#include <math.h>
+#include <stdarg.h>
 #include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -29,6 +31,9 @@ constexpr const char *STREAM_UUID =
 constexpr unsigned VALUE_COUNT =
     static_cast<unsigned>(Group::COUNT);
 
+constexpr unsigned SELECTED_READ_GROUP =
+    static_cast<unsigned>(Group::LMS);
+
 QueueHandle_t snapshots = nullptr;
 
 std::atomic<bool> ready{false};
@@ -44,6 +49,97 @@ BLECharacteristic *terminalWrite = nullptr;
 BLE2902 *subscription = nullptr;
 
 std::atomic<uint16_t> peerMtu{23};
+
+// BLE deliberately publishes a compact selection. The full group formatter in
+// TelemetryReport remains the Serial Monitor formatter.
+class BleLine {
+public:
+    BleLine(char *buffer, size_t capacity) : buffer_(buffer), capacity_(capacity) {
+        if (capacity_) buffer_[0] = 0;
+    }
+
+    void append(const char *format, ...) {
+        if (!ok_ || used_ >= capacity_) { ok_ = false; return; }
+        va_list args;
+        va_start(args, format);
+        const int count = vsnprintf(buffer_ + used_, capacity_ - used_, format, args);
+        va_end(args);
+        if (count < 0 || static_cast<size_t>(count) >= capacity_ - used_) {
+            ok_ = false;
+            return;
+        }
+        used_ += static_cast<size_t>(count);
+    }
+
+    void value(float number, const char *unit, unsigned decimals = 1) {
+        if (isfinite(number)) append("%.*f%s", static_cast<int>(decimals), number, unit);
+        else append("--");
+    }
+
+    bool finish() {
+        append("\n");
+        if (!ok_ && capacity_) buffer_[0] = 0;
+        return ok_;
+    }
+
+private:
+    char *buffer_;
+    size_t capacity_;
+    size_t used_ = 0;
+    bool ok_ = true;
+};
+
+void p1Counter(BleLine &line, uint32_t elapsedMs, float reference) {
+    if (isfinite(reference))
+        line.append("%lu/30s", static_cast<unsigned long>(elapsedMs / 1000UL));
+    else
+        line.append("--");
+}
+
+bool formatBleSelection(const Snapshot &snapshot, char *output, size_t capacity) {
+    const float sessionDev =
+    (isfinite(snapshot.rmssd) &&
+     isfinite(snapshot.session) &&
+     snapshot.session > 0.0f)
+        ? rmssd::Monitor::deviation(snapshot.rmssd, snapshot.session)
+        : NAN;
+
+const float shortDev =
+    (isfinite(snapshot.rmssd) &&
+     isfinite(snapshot.shortReference) &&
+     snapshot.shortReference > 0.0f)
+        ? rmssd::Monitor::deviation(snapshot.rmssd, snapshot.shortReference)
+        : NAN;
+    const auto &pdr = snapshot.respiration;
+
+    BleLine line(output, capacity);
+    line.append("Time:%lus", static_cast<unsigned long>(snapshot.uptimeSeconds));
+    line.append(" | LMS_HR:"); line.value(snapshot.hr, "bpm");
+    line.append(" | LMS_IBI:"); line.value(snapshot.ibi, "ms", 0);
+    // line.append(" | RMSSD:"); line.value(snapshot.rmssd, "ms");
+    line.append(" | PersonalBaseline:"); line.value(snapshot.personal, "ms");
+    line.append(" | DEV:"); line.value(sessionDev, "%");
+    line.append(" | ShortDEV:"); line.value(shortDev, "%");
+    // line.append(" | BaselineCal:%s", snapshot.sessionState);
+    line.append(" | Cal100:%lu/%lus",
+                static_cast<unsigned long>(snapshot.sessionValidMs / 1000UL),
+                static_cast<unsigned long>(snapshot.sessionTargetMs / 1000UL));
+    line.append(" | Session30:"); p1Counter(line, snapshot.p1Ms[0], snapshot.session);
+    line.append(" | Short30:"); p1Counter(line, snapshot.p1Ms[1], snapshot.shortReference);
+    line.append(" | P1:%s", snapshot.p1Triggered ? "YES" : "NO");
+    line.append(" | PDR:"); line.value(pdr.valid ? pdr.rate : NAN, "brpm");
+    line.append(" | PDRStatus:%s", pdr::statusName(pdr.status));
+    // line.append(" | CoverFV:"); line.value(100.0f * pdr.coverageFV, "%");
+    // line.append(" | CandFV:"); line.value(pdr.fv.candidate, "brpm");
+    // Display current motion state through BLE
+const char *motionText =
+    snapshot.motion == 0 ? "LOW" :
+    snapshot.motion == 1 ? "MODERATE" :
+    snapshot.motion == 2 ? "HIGH" : "UNKNOWN";
+
+line.append(" | Motion:%s", motionText);
+    return line.finish();
+}
 
 
 // ============================================================
@@ -217,8 +313,9 @@ void worker(void *) {
             ESP_GATT_PERM_READ);
 
         description->setValue(
-            groupName(
-                static_cast<Group>(i)));
+            i == SELECTED_READ_GROUP
+                ? "Selected Sutra telemetry"
+                : "Reserved - use selected telemetry");
 
         values[i]->addDescriptor(description);
 
@@ -355,55 +452,42 @@ void worker(void *) {
 
         char line[LINE_CAPACITY];
 
+        if (!formatBleSelection(snapshot, line, sizeof(line)))
+            continue;
+
 
 // ------------------------------------------------------------
-// Update normal READ characteristics
+// Update BLE READ characteristics
+//
+// Keep the existing UUIDs, but only the selected-telemetry characteristic
+// exposes live values. The legacy full-group BLE formatter is intentionally
+// retained below as a comment; Serial still uses it in main.cpp.
 // ------------------------------------------------------------
-
         for (unsigned i = 0;
              i < VALUE_COUNT;
              ++i) {
+            values[i]->setValue(i == SELECTED_READ_GROUP ? std::string(line) : "--");
 
-            if (formatLine(
-                    static_cast<Group>(i),
-                    snapshot,
-                    line,
-                    sizeof(line))) {
-
-                values[i]->setValue(
-                    std::string(line));
-            }
+            // Legacy full BLE group output, retained for future restoration:
+            // if (formatLine(static_cast<Group>(i), snapshot, line, sizeof(line)))
+            //     values[i]->setValue(std::string(line));
         }
 
 
 // ------------------------------------------------------------
-// Send complete telemetry continuously through 01FF
+// Send selected telemetry through 01FF
 // ------------------------------------------------------------
+        if (connected.load() && subscription && subscription->getNotifications())
+            sendLine(line);
 
-        for (unsigned i = 0;
-             i < VALUE_COUNT;
-             ++i) {
-
-            if (!connected.load())
-                break;
-
-            if (!subscription ||
-                !subscription->getNotifications())
-                break;
-
-            if (formatLine(
-                    static_cast<Group>(i),
-                    snapshot,
-                    line,
-                    sizeof(line))) {
-
-                sendLine(line);
-            }
-        }
+        // Legacy full BLE notification loop, retained for future restoration:
+        // for (unsigned i = 0; i < VALUE_COUNT; ++i)
+        //     if (formatLine(static_cast<Group>(i), snapshot, line, sizeof(line)))
+        //         sendLine(line);
 
 
 // ------------------------------------------------------------
-// Blank line between each one-second telemetry block
+// Blank line between each one-second selected telemetry update
 // ------------------------------------------------------------
 
         sendLine("\r\n");

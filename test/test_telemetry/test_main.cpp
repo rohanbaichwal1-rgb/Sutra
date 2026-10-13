@@ -64,7 +64,7 @@ void test_passive_pdr_output_and_protocol_independence() {
     auto s = sample();
     char before[telemetry::LINE_CAPACITY], after[telemetry::LINE_CAPACITY];
     TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::PDR,s,before,sizeof(before)));
-    TEST_ASSERT_NOT_NULL(strstr(before,"Rate:-- | Q:-- | RIAV:-- | RIFV:-- | INVALID | Reason:WARMUP"));
+    TEST_ASSERT_NOT_NULL(strstr(before,"Rate:-- | Q:-- | RIAV:-- | RIFV:-- | WARMUP | Reason:WARMUP"));
     for (auto group : {telemetry::Group::P1,telemetry::Group::SESSION}) {
         s.respiration = pdr::Result{};
         TEST_ASSERT_TRUE(telemetry::formatLine(group,s,before,sizeof(before)));
@@ -81,7 +81,14 @@ void test_passive_pdr_output_and_protocol_independence() {
     s.respiration.status = pdr::Status::DISAGREE;
     TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::PDR,s,after,sizeof(after)));
     TEST_ASSERT_NOT_NULL(strstr(after,"Rate:--"));
-    TEST_ASSERT_NOT_NULL(strstr(after,"INVALID | Reason:DISAGREE"));
+    TEST_ASSERT_NOT_NULL(strstr(after,"DISAGREE | Reason:DISAGREE"));
+    s.respiration.valid = true;
+    s.respiration.rate = 13.5f;
+    s.respiration.quality = 0.66f;
+    s.respiration.status = pdr::Status::HELD;
+    TEST_ASSERT_TRUE(telemetry::formatLine(telemetry::Group::PDR,s,after,sizeof(after)));
+    TEST_ASSERT_NOT_NULL(strstr(after,"Rate:13.5 brpm | Q:0.66"));
+    TEST_ASSERT_NOT_NULL(strstr(after,"| HELD"));
 }
 
 void test_small_buffer_is_cleared_without_overrun() {

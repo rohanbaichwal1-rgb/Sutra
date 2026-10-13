@@ -28,56 +28,46 @@ app that only supports fitness heart-rate straps will not automatically decode i
 
 Service UUID: `7d2a0000-8f5a-4b10-9b6d-6f7574726100`.
 
-Serial and BLE share the same eight labeled text groups, each on its own line.
-Every line starts with device uptime (`[266s]`), and a blank line separates reports.
-The group characteristics below support READ of the complete latest line.
-Their UUIDs share the service suffix; the first eight digits identify the group:
+Serial keeps its complete labeled groups. BLE publishes one compact selected-data
+line approximately once per second; it does not mirror the Serial diagnostics.
+The existing READ UUIDs remain stable. `7d2a0102` returns the latest compact line;
+the other legacy group characteristics return `--` so they do not expose
+additional live variables.
 
 | UUID prefix | Group | Contents |
 |---|---|---|
-| `7d2a0101` | Normal | Reference detector HR/IBI, finger, motion, IMU |
-| `7d2a0102` | LMS | LMS HR/median IBI, RMSSD, convergence, stability, freshness |
-| `7d2a0103` | PDR | Respiratory rate, quality (0-1), RIAV/RIFV rates, validity and unavailable reason |
-| `7d2a0104` | P1 | Reference timers, triggered flag/source/count, initial and follow-up playback/status |
-| `7d2a0106` | SessionBaseline | Frozen RMSSD, deviation, current session time/sample progress, storage status |
-| `7d2a0107` | Short | Adapting RMSSD, deviation, qualifying time, block progress, breaks, collection gate |
-| `7d2a0108` | PersonalBaseline | Seven-session RMSSD, saved session count, deviation |
-| `7d2a0109` | System | BLE, maximum loop gap, post-exercise wait, active rearm timer, haptics |
-| `7d2a01ff` | All groups | Newline-delimited text stream containing all eight groups |
+| `7d2a0101` | Legacy Normal | `--` |
+| `7d2a0102` | Selected telemetry | Latest compact BLE line |
+| `7d2a0103` | Legacy PDR | `--` |
+| `7d2a0104` | Legacy P1 | `--` |
+| `7d2a0106` | Legacy Session | `--` |
+| `7d2a0107` | Legacy Short | `--` |
+| `7d2a0108` | Legacy Personal | `--` |
+| `7d2a0109` | Legacy System | `--` |
+| `7d2a01ff` | Selected stream | Newline-delimited compact BLE line |
 
 Retired UUID slot `7d2a0105` is unused; other group UUIDs have not moved.
 
 For live output, enable notifications on
 `7d2a01ff-8f5a-4b10-9b6d-6f7574726100` and select UTF-8/text display.
-The stream splits long lines across notifications to fit the negotiated ATT MTU
+The stream can split long lines across notifications to fit the negotiated ATT MTU
 (default 20 payload bytes). A terminal that joins incoming text displays complete
 lines; a GATT explorer that logs each packet separately may display fragments.
 Requesting MTU 247 or 517, when supported by the app, reduces fragmentation.
-The separate READ fields always contain complete lines; the app must support
-long reads if a line exceeds its read payload. Reconnect and refresh the app's
-cached services after uploading: these grouped UUIDs replace the old scalar/CSV fields.
+The selected READ field contains a complete line; the app must support long reads
+if it exceeds its read payload. Reconnect and refresh the app's cached services
+after uploading.
 
 Example (illustrative values):
 
 ```text
-[266s] Normal | HR:77.7bpm | IBI:761ms | Finger:Y | Motion:LOW | IMU:OK
-[266s] LMS | HR:78.0bpm | IBI:770ms | RMSSD:80.0ms | Converged:Y | RMSSDstable:Y | Fresh:Y
-[266s] P1 | Session:0/30s | Short:0/30s | 7Session:-- | Triggered:N | Source:NONE
-[266s] SessionBaseline | RMSSD:100.0ms | Dev:20.0% | Valid:100/100s | Samples:20/20 | State:FROZEN | Storage:SAVED
+Time:266s | LMS_HR:78.0bpm | LMS_IBI:770ms | PersonalBaseline:100.0ms | DEV:20.0% | ShortDEV:12.5% | Cal100:100/100s | Session30:0/30s | Short30:0/30s | P1:NO | PDR:14.2brpm
 ```
 
-`--` means unavailable; booleans are Y/N. RMSSD deviation is positive for a drop;
+`--` means unavailable. RMSSD deviation is positive for a drop;
 PDR BRPM is available only when RIFV passes its existing coverage, modulation, and
-quality checks. RIAV remains a diagnostic value and does not gate or fuse into BRPM. `Normal` uses
-the existing non-LMS reference beat detector; it is separate from the LMS values
-used by the RMSSD logic. PDR is display-only with no P1/follow-up connections; see
+quality checks. PDR is display-only with no P1/follow-up connections; see
 [pdr-observer.md](pdr-observer.md).
-
-## Enable or disable BLE
-
-Set `SUTRA_BLE_ENABLED` near the top of `src/main.cpp` to `1` or `0`, then rebuild
-and upload. With the value set to `0`, BLE initialization and publishing are
-compiled out while the same Serial telemetry remains active.
 
 Snapshots are produced about once per second, not as a lossless sample/beat log.
 Bluetooth delivery is best effort; congested connections can lose notifications,

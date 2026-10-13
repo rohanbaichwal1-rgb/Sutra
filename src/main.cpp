@@ -55,7 +55,12 @@
 #include "BleTelemetry.h"
 #include "PdrService.h"
 #include <PdrPulseAmplitude.h>
+#include <HighMotionProcessor.h>
 #include <esp_system.h>
+
+#if HIGH_MOTION_PROCESSOR_ENABLED
+highmotion::Processor highMotionProcessor;
+#endif
 
 rmssd::Monitor referenceMonitor;
 personal::Collector sessionCollector;
@@ -2348,6 +2353,9 @@ void loop()
 
     particleSensor.check();
 
+#if HIGH_MOTION_PROCESSOR_ENABLED
+    highMotionProcessor.beginBatch(micros(), particleSensor.available());
+#endif
     while (particleSensor.available())
     {
         uint32_t green =
@@ -2358,6 +2366,15 @@ void loop()
         uint32_t nowMs = millis();
 
         processSample(green, nowMs);
+
+#if HIGH_MOTION_PROCESSOR_ENABLED
+        const uint32_t shadowStartUs = micros();
+        highMotionProcessor.setActive(motionState == MOTION_HIGH,
+                                      fingerPresent && nowMs >= contactSettleUntilMs,
+                                      shadowStartUs);
+        highMotionProcessor.pushPpg(static_cast<float>(green));
+        highMotionProcessor.recordProcessingTime(micros() - shadowStartUs);
+#endif
 
         // --------------------------------------------
         // Count actual LMS samples
@@ -2383,11 +2400,18 @@ void loop()
     {
         lastBMI270 += 10000UL;
 
+#if HIGH_MOTION_PROCESSOR_ENABLED
+        const uint32_t shadowImuStartUs = micros();
+#endif
         latestAccelOK =
             imu.readAccel(
                 latestAX,
                 latestAY,
                 latestAZ);
+
+#if HIGH_MOTION_PROCESSOR_ENABLED
+        const uint32_t shadowImuEndUs = micros();
+#endif
 
         latestGyroOK =
             imu.readGyro(
@@ -2397,6 +2421,11 @@ void loop()
 
         latestTempOK =
             imu.readTemperatureC(latestTemp);
+
+#if HIGH_MOTION_PROCESSOR_ENABLED
+        highMotionProcessor.pushImu(shadowImuStartUs + (shadowImuEndUs - shadowImuStartUs) / 2,
+                                    latestAX, latestAY, latestAZ, latestAccelOK);
+#endif
 
         // Only update motion features from valid sensor reads.
         // Stale/failed IMU samples must not drive LMS adaptation.
@@ -2430,6 +2459,48 @@ void loop()
 
     uint32_t nowMs = millis();
 
+#if HIGH_MOTION_PROCESSOR_ENABLED
+    const uint32_t shadowPollStartUs = micros();
+    highMotionProcessor.setActive(motionState == MOTION_HIGH,
+                                  fingerPresent && nowMs >= contactSettleUntilMs,
+                                  shadowPollStartUs);
+    highMotionProcessor.poll(shadowPollStartUs);
+    highMotionProcessor.recordProcessingTime(micros() - shadowPollStartUs);
+#if HIGH_MOTION_DEBUG
+    static uint32_t lastHighMotionDebugMs = 0;
+    if (nowMs - lastHighMotionDebugMs >= 1000) {
+        lastHighMotionDebugMs = nowMs;
+        const auto hm = highMotionProcessor.read(micros());
+        static unsigned debugPage = 0;
+        char debugLine[128];
+        int length;
+        if (debugPage == 0)
+            length = snprintf(debugLine, sizeof(debugLine),
+                "[HIGH_MOTION] motion=%u HR=%.1f IBI=%.1f Q=%.2f ready=%u valid=%u reason=%s\n",
+                static_cast<unsigned>(motionState), hm.hr, hm.ibiMs, hm.confidence,
+                hm.ready, hm.valid, highmotion::reasonName(hm.reason));
+        else if (debugPage == 1)
+            length = snprintf(debugLine, sizeof(debugLine),
+                "[HIGH_MOTION] accepted=%lu rejected=%lu lastReject=%s adapt=%u norm=%.2f\n",
+                static_cast<unsigned long>(hm.accepted), static_cast<unsigned long>(hm.rejected),
+                highmotion::reasonName(hm.lastRejection), hm.adapting, hm.coefficientNorm);
+        else if (debugPage == 2)
+            length = snprintf(debugLine, sizeof(debugLine),
+                "[HIGH_MOTION] aligned=%u estimated=%u drops=%lu period=%.0f maxUs=%lu\n",
+                hm.aligned, hm.timestampsEstimated, static_cast<unsigned long>(hm.alignmentDrops),
+                hm.samplePeriodUs, static_cast<unsigned long>(hm.maxProcessingUs));
+        else
+            length = snprintf(debugLine, sizeof(debugLine),
+                "[HIGH_MOTION] amp=%.1f floor=%.1f riseMs=%.1f corr=%.2f cancel=%.2f\n",
+                hm.candidateAmplitude, hm.candidateFloor, hm.candidateRiseMs,
+                hm.residualCorrelation, hm.cancellationRatio);
+        debugPage = (debugPage + 1) % 4;
+        if (length > 0 && length < static_cast<int>(sizeof(debugLine)) && Serial.availableForWrite() >= length)
+            Serial.write(reinterpret_cast<const uint8_t *>(debugLine), length);
+    }
+#endif
+#endif
+
     // Keep an already-running P1 hold alive long enough for the monitor to
     // apply its bounded blank-DEV tolerance at the next report.
     if (!isReferenceInputFresh(nowMs) || !latestAccelOK || !latestGyroOK)
@@ -2439,8 +2510,10 @@ void loop()
     }
 
     // Independent observer. Its output is never passed to the RMSSD monitor.
-    pdrService::context(nowMs, {fingerPresent&& latestAccelOK && latestGyroOK,
-                                motionState != MOTION_HIGH});
+    pdrService::context(nowMs, {
+    fingerPresent && latestAccelOK && latestGyroOK,
+    true
+});
 
     if (nowMs - rateWindowStartMs >= 1000)
     {
@@ -2484,6 +2557,9 @@ void loop()
         const bool fresh = isReferenceInputFresh(nowMs);
         telemetry::Snapshot snapshot{};
         snapshot.hr = lmsValid ? lmsHR_smoothed : NAN;
+#if HIGH_MOTION_PROCESSOR_ENABLED && HIGH_MOTION_OUTPUT_OVERRIDE
+        snapshot.hr = highMotionProcessor.selectHr(snapshot.hr, motionState == MOTION_HIGH, micros());
+#endif
         snapshot.ibi = lmsValid && latestCleanedIBI > 0 ? medianRecentLmsIbi() : NAN;
         snapshot.rmssd = fresh ? currentRMSSD : NAN;
         snapshot.session = sessionCollector.complete() ? sessionCollector.median() : NAN;

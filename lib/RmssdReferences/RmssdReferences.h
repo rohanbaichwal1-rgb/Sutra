@@ -15,9 +15,9 @@ constexpr uint32_t POST_EXERCISE_RECOVERY_MS = 60000UL;
 constexpr uint32_t MAX_REPORT_GAP_MS = 2500UL;
 constexpr uint32_t P1_HOLD_MS = 30000UL;
 constexpr uint32_t P1_FOLLOW_UP_DELAY_MS = 5000UL;
-constexpr uint8_t P1_MAX_CONSECUTIVE_BLANK_DEV = 10;
+constexpr uint8_t P1_MAX_CONSECUTIVE_BLANK_DEV = 5;
 // Prototype test thresholds: percentage drop below each available reference.
-constexpr float P1_DROP_PCT = 15.0f;
+constexpr float P1_DROP_PCT = 10.0f;
 
 enum class FollowUp : uint8_t { IDLE, PENDING, ISSUED, CANCELLED };
 enum class FollowUpEvent : uint8_t { NONE, START, CANCELLED };

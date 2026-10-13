@@ -321,7 +321,7 @@ Events Monitor::update(const Input &in)
     float shortDrop = deviation(in.current, shortValue_);
 
     checkFollowUp(in);
-    // A running P1 hold may bridge at most ten consecutive blank DEV reports.
+    // A running P1 hold may bridge at most five consecutive blank DEV reports.
     // Blank DEV cannot start a hold; post-exercise state, report gaps, and
     // unavailable reference paths still reset immediately. LOW and MODERATE
     // motion both preserve normal P1 counting; HIGH remains disqualifying.
@@ -362,9 +362,9 @@ Events Monitor::update(const Input &in)
     // haptic completion.  The runtime haptic path uses the completed-
     // intervention + zero-counter transition above instead of WAIT_RECOVERY.
     bool recovered = (shortReady_ || sessionReady || longReady) &&
-                     (!shortReady_ || shortDrop < 15) &&
-                     (!sessionReady || sessionDrop < 15) &&
-                     (!longReady || longDrop < 15);
+                     (!shortReady_ || shortDrop < 10) &&
+                     (!sessionReady || sessionDrop < 10) &&
+                     (!longReady || longDrop < 10);
     recovery_.update(p1Fired_ && !interventionComplete_ && qualifies && in.stable &&
                      recovered && !in.interventionActive, in.now);
     if (recovery_.reached(in.now, RECOVERY_HOLD_MS))

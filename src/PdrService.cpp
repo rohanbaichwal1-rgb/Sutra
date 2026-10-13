@@ -16,25 +16,44 @@ struct Event {
 };
 QueueHandle_t inputs = nullptr, outputs = nullptr;
 std::atomic<bool> lost{false};
+std::atomic<uint32_t> lostTime{0};
 pdr::Observer observer; // owned exclusively by worker
 bool haveContext = false;
 uint32_t lastContextMs = 0;
 unsigned lastContextMask = 0;
-void post(const Event &event) {
-    if (inputs && xQueueSend(inputs, &event, 0) != pdTRUE) lost.store(true);
+bool post(const Event &event) {
+    if (!inputs)
+        return false;
+
+    if (xQueueSend(inputs, &event, 0) == pdTRUE)
+        return true;
+
+    // Losing a beat or contact event compromises
+    // continuity, so the observer must be informed.
+    if (event.kind != Kind::CONTEXT)
+        lost.store(true);
+
+    return false;
 }
 void worker(void *) {
     Event event;
+    bool lossPending = false;
+    uint32_t pendingLossTime = 0;
     for (;;) {
         if (xQueueReceive(inputs, &event, portMAX_DELAY) != pdTRUE) continue;
-        if (lost.exchange(false)) {
-            // Missing beats/context make the entire respiratory window suspect.
-            xQueueReset(inputs);
-            observer.dataLost(event.time, pdr::ResetReason::QUEUE_OVERFLOW);
+
+        if (lost.exchange(false) && !lossPending) {
+            lossPending = true;
+            pendingLossTime = lostTime.load();
+        }
+
+        if (lossPending && (uint32_t)(event.time - pendingLossTime) < 0x80000000UL) {
+            observer.dataLost(pendingLossTime, pdr::ResetReason::QUEUE_OVERFLOW);
             pdr::Result result = observer.result();
             xQueueOverwrite(outputs, &result);
-            continue;
+            lossPending = false;
         }
+
         switch (event.kind) {
         case Kind::BEAT: observer.addBeat(event.time, event.amplitude, event.ibi); break;
         case Kind::CONTACT: observer.contactChanged(event.time); break;
@@ -65,11 +84,31 @@ void contactChanged(uint32_t now) {
     Event event; event.kind = Kind::CONTACT; event.time = now; post(event);
 }
 void context(uint32_t now, const pdr::Context &context) {
-    const unsigned mask = context.signalGood | (context.lowMotion << 1);
-    if (haveContext && mask == lastContextMask && now-lastContextMs < 100) return;
-    haveContext = true; lastContextMs = now; lastContextMask = mask;
-    Event event; event.kind = Kind::CONTEXT; event.time = now; event.context = context;
-    post(event);
+    const unsigned mask =
+        (context.signalGood ? 1u : 0u) |
+        (context.lowMotion ? 2u : 0u);
+
+    const bool changed =
+        !haveContext || mask != lastContextMask;
+
+    if (!changed &&
+        now - lastContextMs < 100)
+        return;
+
+    Event event;
+    event.kind = Kind::CONTEXT;
+    event.time = now;
+    event.context = context;
+
+    if (post(event)) {
+        haveContext = true;
+        lastContextMs = now;
+        lastContextMask = mask;
+    } else if (changed) {
+        // Important state transition could not be
+        // delivered. Do not silently lose it.
+        lost.store(true);
+    }
 }
 pdr::Result read(uint32_t now) {
     pdr::Result result;

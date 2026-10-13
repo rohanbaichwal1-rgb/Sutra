@@ -103,7 +103,7 @@ bool formatLine(Group group, const Snapshot &s, char *output, size_t capacity) {
         line.append(" | Q:"); line.value(p.valid ? p.quality : NAN,"",2);
         line.append(" | RIAV:"); line.value(p.riav);
         line.append(" | RIFV:"); line.value(p.rifv);
-        line.append(" | %s",p.valid ? "VALID" : "INVALID");
+        line.append(" | %s",pdr::statusName(p.status));
         if (!p.valid) line.append(" | Reason:%s",pdr::statusName(p.status));
         pdrChannel(line,"AV",p.av);
         pdrChannel(line,"FV",p.fv);

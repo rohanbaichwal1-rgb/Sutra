@@ -476,7 +476,7 @@ void Observer::update(uint32_t now, const Context &context) {
     }
     if (haveUpdate_ && now-lastUpdate_ > MAX_GAP_MS)
         clearHistory(Status::GAP, ResetReason::CONTEXT_GAP, now, now-lastUpdate_);
-    if (!context.signalGood || !context.lowMotion) {
+    if (!context.signalGood) {
         if (acceptingBeats_) {
             // A beat event can arrive just before its bad-context notification.
             // Retract unconfirmed recent samples, retain the preceding good history.
@@ -490,7 +490,7 @@ void Observer::update(uint32_t now, const Context &context) {
         acceptingBeats_ = false;
         haveUpdate_ = true; lastUpdate_ = now;
         result_.beatAgeMs = count_ ? now-beats_[(head_+BEAT_CAPACITY-1)%BEAT_CAPACITY].time : UINT32_MAX;
-        invalidate(context.lowMotion ? Status::SIGNAL : Status::MOTION);
+        invalidate(Status::SIGNAL);
         return;
     }
     haveUpdate_ = true; lastUpdate_ = now;
