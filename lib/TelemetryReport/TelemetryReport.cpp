@@ -96,6 +96,17 @@ bool formatLine(Group group, const Snapshot &s, char *output, size_t capacity) {
             (unsigned long)s.rmssdRejectRange,(unsigned long)s.hrRejected,
             (unsigned long)s.shapeRejected,(unsigned long)s.lastRmssdInput,
             (unsigned long)s.lastRmssdRejected);
+        // Append the independent Elgendi diagnosis only during HIGH motion.
+        // The preceding IBI field is intentionally the original LMS IBI.
+        if (s.motion == 2) {
+            line.append(" | HRsrc:HIGH_ELGENDI | IBIsrc:ORIGINAL_LMS");
+            line.append(" | HMraw:"); line.value(s.highRawIbiMs,"ms",0);
+            line.append(" | HMcorr:"); line.value(s.highCorrectedIbiMs,"ms",0);
+            line.append(" | HMtrack:"); line.value(s.highTrackedIbiMs,"ms",0);
+            line.append(" | HMAge:"); line.value(s.highBeatAgeMs,"ms",0);
+            line.append(" | HMCancel:"); line.value(s.highCancellationRatio,"",2);
+            line.append(" | HMvalid:%s",yn(s.highMotionValid));
+        }
         break;
     case Group::PDR: {
         const auto &p = s.respiration;

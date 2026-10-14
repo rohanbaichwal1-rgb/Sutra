@@ -138,6 +138,18 @@ const char *motionText =
     snapshot.motion == 2 ? "HIGH" : "UNKNOWN";
 
 line.append(" | Motion:%s", motionText);
+    // Compact HIGH-motion diagnostics from v5's independent Elgendi processor.
+    // These are fields of the same immutable snapshot sent to Serial Monitor.
+    // Existing LMS_IBI is NOT replaced and HRV inputs remain untouched.
+    if (snapshot.motion == 2) {
+        line.append(" | HRsrc:HIGH_ELGENDI");
+        line.append(" | HMraw:"); line.value(snapshot.highRawIbiMs,"ms",0);
+        line.append(" | HMcorr:"); line.value(snapshot.highCorrectedIbiMs,"ms",0);
+        line.append(" | HMtrack:"); line.value(snapshot.highTrackedIbiMs,"ms",0);
+        line.append(" | HMAge:"); line.value(snapshot.highBeatAgeMs,"ms",0);
+        line.append(" | HMCancel:"); line.value(snapshot.highCancellationRatio,"",2);
+        line.append(" | HMvalid:%s", snapshot.highMotionValid ? "Y" : "N");
+    }
     return line.finish();
 }
 

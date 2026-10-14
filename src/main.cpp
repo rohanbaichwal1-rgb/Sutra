@@ -2468,6 +2468,7 @@ void loop()
     highMotionProcessor.recordProcessingTime(micros() - shadowPollStartUs);
 #if HIGH_MOTION_DEBUG
     static uint32_t lastHighMotionDebugMs = 0;
+    static uint32_t lastHighMotionRejectDebugMs = 0;
     if (nowMs - lastHighMotionDebugMs >= 1000) {
         lastHighMotionDebugMs = nowMs;
         const auto hm = highMotionProcessor.read(micros());
@@ -2495,8 +2496,37 @@ void loop()
                 hm.candidateAmplitude, hm.candidateFloor, hm.candidateRiseMs,
                 hm.residualCorrelation, hm.cancellationRatio);
         debugPage = (debugPage + 1) % 4;
-        if (length > 0 && length < static_cast<int>(sizeof(debugLine)) && Serial.availableForWrite() >= length)
+                if (length > 0 && length < static_cast<int>(sizeof(debugLine)) &&
+            Serial.availableForWrite() >= length)
             Serial.write(reinterpret_cast<const uint8_t *>(debugLine), length);
+    }
+
+    // Print individual HIGH-motion rejection counters every 5 seconds.
+    if (nowMs - lastHighMotionRejectDebugMs >= 5000UL) {
+        lastHighMotionRejectDebugMs = nowMs;
+
+        const auto hm = highMotionProcessor.read(micros());
+
+        char rejectLine[128];
+
+        int rejectLength = snprintf(
+            rejectLine, sizeof(rejectLine),
+            "[HIGH_MOTION_REJECTS] AMP=%lu MORPH=%lu INTERVAL=%lu MOTION=%lu TIMING=%lu\n",
+            (unsigned long)hm.amplitudeRejects,
+            (unsigned long)hm.morphologyRejects,
+            (unsigned long)hm.intervalRejects,
+            (unsigned long)hm.motionRejects,
+            (unsigned long)hm.timingRejects
+        );
+
+        if (rejectLength > 0 &&
+            rejectLength < static_cast<int>(sizeof(rejectLine)) &&
+            Serial.availableForWrite() >= rejectLength) {
+            Serial.write(
+                reinterpret_cast<const uint8_t *>(rejectLine),
+                rejectLength
+            );
+        }
     }
 #endif
 #endif
@@ -2559,6 +2589,24 @@ void loop()
         snapshot.hr = lmsValid ? lmsHR_smoothed : NAN;
 #if HIGH_MOTION_PROCESSOR_ENABLED && HIGH_MOTION_OUTPUT_OVERRIDE
         snapshot.hr = highMotionProcessor.selectHr(snapshot.hr, motionState == MOTION_HIGH, micros());
+#endif
+#if HIGH_MOTION_PROCESSOR_ENABLED
+        // Read the independent processor once per second for Serial + BLE.
+        // Diagnostics are display-only: NEVER feed these IBIs to RMSSD/PDR/P1.
+        // Requires the v5 HighMotionProcessor.h that defines these Result fields.
+        const auto highDiag = highMotionProcessor.read(micros());
+        snapshot.highMotionValid = highDiag.valid;
+        snapshot.highRawIbiMs = highDiag.rawIbiMs > 0.0f && isfinite(highDiag.rawIbiMs)
+            ? highDiag.rawIbiMs : NAN;
+        snapshot.highCorrectedIbiMs = highDiag.correctedIbiMs > 0.0f && isfinite(highDiag.correctedIbiMs)
+            ? highDiag.correctedIbiMs : NAN;
+        snapshot.highTrackedIbiMs = highDiag.trackedIbiMs > 0.0f && isfinite(highDiag.trackedIbiMs)
+            ? highDiag.trackedIbiMs : NAN;
+        snapshot.highBeatAgeMs = highDiag.beatAgeMs;
+        // The NLMS cancellation ratio is last measured when Elgendi emitted
+        // a beat candidate; it is not a continuously refreshed ratio.
+        snapshot.highCancellationRatio = highDiag.candidateAmplitude > 0.0f &&
+            isfinite(highDiag.cancellationRatio) ? highDiag.cancellationRatio : NAN;
 #endif
         snapshot.ibi = lmsValid && latestCleanedIBI > 0 ? medianRecentLmsIbi() : NAN;
         snapshot.rmssd = fresh ? currentRMSSD : NAN;

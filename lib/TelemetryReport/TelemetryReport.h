@@ -1,6 +1,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include <math.h> // NAN denotes a HIGH-motion diagnostic not yet measured.
 #include <PdrObserver.h>
 #include <RmssdReferences.h>
 #include <HapticPlayback.h>
@@ -14,6 +15,13 @@ struct Snapshot {
     uint8_t finger, motion, converged, stable, fresh, savedSessions, episode;
     pdr::Result respiration;
     float normalHr = 0, normalIbi = 0;
+    // Independent v5 HIGH-motion Elgendi diagnostics, captured once per report.
+    // IMPORTANT: Snapshot::ibi remains the ORIGINAL LMS IBI for HRV/RMSSD.
+    // NaN means that no corresponding HIGH-motion estimate exists yet.
+    float highRawIbiMs = NAN, highCorrectedIbiMs = NAN;
+    float highTrackedIbiMs = NAN, highBeatAgeMs = NAN;
+    float highCancellationRatio = NAN;
+    bool highMotionValid = false;
     bool imuOK = false, p1Triggered = false;
     uint32_t p1TriggerCount = 0; // Events since boot, not motor starts.
     bool hapticFault = false;
