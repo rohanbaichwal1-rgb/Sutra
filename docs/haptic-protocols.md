@@ -40,6 +40,8 @@ converted to DA7280's 0-127 DRO code range without an additional scale factor.
 
 ## P1: randomized flutter
 
+[P1 and Follow-up Pattern Flowchart (PDF)](pdfs/P1_Followup_Pattern_Flowchart_4.pdf)
+
 - Duration: 5 seconds.
 - One motor is active at direct DRO value 60 for each 200 ms slot.
 - Each group of three slots contains M1, M2, and M3 exactly once in a new random

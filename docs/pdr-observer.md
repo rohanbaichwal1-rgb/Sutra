@@ -5,6 +5,8 @@ support, or rate-match interface. Its output is read only by telemetry.
 
 ## Processing flow
 
+[PDR Flowchart (PDF)](pdfs/PDR_Flowchart_5.pdf)
+
 The implementation follows the PDR calculation flowchart: acquire PPG, retain
 accepted beats, derive beat-level features, assess rolling-window coverage,
 estimate respiratory modulation, then publish only a sufficiently reliable

@@ -19,6 +19,8 @@ stress, and PDR is context rather than a trigger.
 
 ## System flow
 
+[Overall Project Flowchart (PDF)](pdfs/Sutra_Overall_Project_Flowchart_1.pdf)
+
 ```mermaid
 flowchart LR
     PPG[MAX30101 PPG] --> Clean[LMS motion-noise cancellation]
@@ -77,6 +79,8 @@ gantt
 ```
 
 ## Detailed documents
+
+[Hardware Schematic (PDF)](pdfs/Sutra_Hardware_Schematic.pdf)
 
 - [Haptic protocols](haptic-protocols.md) — wiring scope, patterns, output scaling, and faults.
 - [LMS and Elgendi pipeline](lms-elgendi.md) — PPG cleaning, beat acceptance, variables, and signal-quality gates.

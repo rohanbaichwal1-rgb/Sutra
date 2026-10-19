@@ -6,6 +6,9 @@ measurement or an arrhythmia detector.
 
 ## What it does
 
+- [LMS HR and IBI Flowchart (PDF)](pdfs/LMS_HR_IBI_Flowchart_3.pdf)
+- [Elgendi Algorithm Flowchart (PDF)](pdfs/Elgendi_Algorithm_Flowchart_2.pdf)
+
 The MAX30101 green-channel signal is cleaned with a motion-informed normalized
 LMS (NLMS) filter. The cleaned signal then enters an Elgendi-style moving-average
 detector that selects one strongest crest per pulse region. Accepted intervals
