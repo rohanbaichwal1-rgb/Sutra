@@ -101,3 +101,9 @@ timing under load, BLE performance, and safe power behavior.
 
 BLE is enabled by default. Set `SUTRA_BLE_ENABLED` to `0` near the top of
 `src/main.cpp` to build a Serial-only firmware.
+
+## Project Resources
+
+- [Bill of Materials (BOM)](https://docs.google.com/spreadsheets/d/16jnI_RCqciEDVtymS20RvoI0vGWJDaZCuYVPvfLnU6E/edit?usp=sharing)
+- [Logs and Results](https://drive.google.com/drive/folders/1aVeMRzjL6tW-ZZqQDzd-o6AU2fAeIhfH)
+- [Sutra Code Overview (PDF)](pdfs/Sutra_Code_Overview.pdf)
