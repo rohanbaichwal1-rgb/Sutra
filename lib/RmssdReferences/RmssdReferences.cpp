@@ -362,9 +362,9 @@ Events Monitor::update(const Input &in)
     // haptic completion.  The runtime haptic path uses the completed-
     // intervention + zero-counter transition above instead of WAIT_RECOVERY.
     bool recovered = (shortReady_ || sessionReady || longReady) &&
-                     (!shortReady_ || shortDrop < 10) &&
-                     (!sessionReady || sessionDrop < 10) &&
-                     (!longReady || longDrop < 10);
+                     (!shortReady_ || shortDrop < 15) &&
+                     (!sessionReady || sessionDrop < 15) &&
+                     (!longReady || longDrop < 15);
     recovery_.update(p1Fired_ && !interventionComplete_ && qualifies && in.stable &&
                      recovered && !in.interventionActive, in.now);
     if (recovery_.reached(in.now, RECOVERY_HOLD_MS))

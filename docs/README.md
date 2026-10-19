@@ -82,11 +82,10 @@ gantt
 
 [Hardware Schematic (PDF)](pdfs/Sutra_Hardware_Schematic.pdf)
 
-- [Haptic protocols](haptic-protocols.md) — wiring scope, patterns, output scaling, and faults.
-- [LMS and Elgendi pipeline](lms-elgendi.md) — PPG cleaning, beat acceptance, variables, and signal-quality gates.
-- [RMSSD references](rmssd-references.md) — baselines, trigger holds, recovery, and persistence.
-- [PDR observer](pdr-observer.md) — respiration estimation and its non-gating role.
-- [BLE telemetry](ble-telemetry.md) — service UUIDs, grouped fields, and notification behaviour.
+- [LMS HR and IBI Flowchart (PDF)](pdfs/LMS_HR_IBI_Flowchart_3.pdf)
+- [Elgendi Algorithm Flowchart (PDF)](pdfs/Elgendi_Algorithm_Flowchart_2.pdf)
+- [P1 and Follow-up Pattern Flowchart (PDF)](pdfs/P1_Followup_Pattern_Flowchart_4.pdf)
+- [PDR Flowchart (PDF)](pdfs/PDR_Flowchart_5.pdf)
 
 ## Build and test
 
@@ -107,3 +106,4 @@ BLE is enabled by default. Set `SUTRA_BLE_ENABLED` to `0` near the top of
 - [Bill of Materials (BOM)](https://docs.google.com/spreadsheets/d/16jnI_RCqciEDVtymS20RvoI0vGWJDaZCuYVPvfLnU6E/edit?usp=sharing)
 - [Logs and Results](https://drive.google.com/drive/folders/1aVeMRzjL6tW-ZZqQDzd-o6AU2fAeIhfH)
 - [Sutra Code Overview (PDF)](pdfs/Sutra_Code_Overview.pdf)
+- [Product Mechanical Design (STEP)](mechanical/SPOC%202%20%281%29.STEP)

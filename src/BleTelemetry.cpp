@@ -77,7 +77,7 @@ public:
     }
 
     bool finish() {
-        append("\n");
+        append("\r\n");
         if (!ok_ && capacity_) buffer_[0] = 0;
         return ok_;
     }
@@ -91,7 +91,8 @@ private:
 
 void p1Counter(BleLine &line, uint32_t elapsedMs, float reference) {
     if (isfinite(reference))
-        line.append("%lu/30s", static_cast<unsigned long>(elapsedMs / 1000UL));
+        line.append("%lu/%lus", static_cast<unsigned long>(elapsedMs / 1000UL),
+                    static_cast<unsigned long>(rmssd::P1_HOLD_MS / 1000UL));
     else
         line.append("--");
 }
@@ -113,43 +114,29 @@ const float shortDev =
     const auto &pdr = snapshot.respiration;
 
     BleLine line(output, capacity);
+    // Five terminal lines per snapshot; full diagnostics remain on Serial.
     line.append("Time:%lus", static_cast<unsigned long>(snapshot.uptimeSeconds));
     line.append(" | LMS_HR:"); line.value(snapshot.hr, "bpm");
     line.append(" | LMS_IBI:"); line.value(snapshot.ibi, "ms", 0);
-    // line.append(" | RMSSD:"); line.value(snapshot.rmssd, "ms");
-    line.append(" | PersonalBaseline:"); line.value(snapshot.personal, "ms");
-    line.append(" | DEV:"); line.value(sessionDev, "%");
-    line.append(" | ShortDEV:"); line.value(shortDev, "%");
-    // line.append(" | BaselineCal:%s", snapshot.sessionState);
-    line.append(" | Cal100:%lu/%lus",
+    const char *motionText = snapshot.motion == 0 ? "LOW" :
+                             snapshot.motion == 1 ? "MODERATE" :
+                             snapshot.motion == 2 ? "HIGH" : "UNKNOWN";
+    line.append(" | Motion:%s", motionText);
+
+    line.append("\r\nSessionDev:"); line.value(sessionDev, "%");
+    line.append(" | ShortDev:"); line.value(shortDev, "%");
+
+    line.append("\r\nCal100:%lu/%lus",
                 static_cast<unsigned long>(snapshot.sessionValidMs / 1000UL),
                 static_cast<unsigned long>(snapshot.sessionTargetMs / 1000UL));
-    line.append(" | Session30:"); p1Counter(line, snapshot.p1Ms[0], snapshot.session);
-    line.append(" | Short30:"); p1Counter(line, snapshot.p1Ms[1], snapshot.shortReference);
+    line.append(" | Session:"); p1Counter(line, snapshot.p1Ms[0], snapshot.session);
+    line.append(" | Short:"); p1Counter(line, snapshot.p1Ms[1], snapshot.shortReference);
     line.append(" | P1:%s", snapshot.p1Triggered ? "YES" : "NO");
-    line.append(" | PDR:"); line.value(pdr.valid ? pdr.rate : NAN, "brpm");
-    line.append(" | PDRStatus:%s", pdr::statusName(pdr.status));
-    // line.append(" | CoverFV:"); line.value(100.0f * pdr.coverageFV, "%");
-    // line.append(" | CandFV:"); line.value(pdr.fv.candidate, "brpm");
-    // Display current motion state through BLE
-const char *motionText =
-    snapshot.motion == 0 ? "LOW" :
-    snapshot.motion == 1 ? "MODERATE" :
-    snapshot.motion == 2 ? "HIGH" : "UNKNOWN";
 
-line.append(" | Motion:%s", motionText);
-    // Compact HIGH-motion diagnostics from v5's independent Elgendi processor.
-    // These are fields of the same immutable snapshot sent to Serial Monitor.
-    // Existing LMS_IBI is NOT replaced and HRV inputs remain untouched.
-    if (snapshot.motion == 2) {
-        line.append(" | HRsrc:HIGH_ELGENDI");
-        line.append(" | HMraw:"); line.value(snapshot.highRawIbiMs,"ms",0);
-        line.append(" | HMcorr:"); line.value(snapshot.highCorrectedIbiMs,"ms",0);
-        line.append(" | HMtrack:"); line.value(snapshot.highTrackedIbiMs,"ms",0);
-        line.append(" | HMAge:"); line.value(snapshot.highBeatAgeMs,"ms",0);
-        line.append(" | HMCancel:"); line.value(snapshot.highCancellationRatio,"",2);
-        line.append(" | HMvalid:%s", snapshot.highMotionValid ? "Y" : "N");
-    }
+    line.append("\r\nPDR:"); line.value(pdr.valid ? pdr.rate : NAN, "brpm");
+    line.append(" | PDRStatus:%s", pdr::statusName(pdr.status));
+
+    line.append("\r\nPersonalBaseline:"); line.value(snapshot.personal, "ms");
     return line.finish();
 }
 

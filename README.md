@@ -10,3 +10,4 @@ See the [SUTRA firmware guide](docs/README.md) for detailed documentation.
 - [Bill of Materials (BOM)](https://docs.google.com/spreadsheets/d/16jnI_RCqciEDVtymS20RvoI0vGWJDaZCuYVPvfLnU6E/edit?usp=sharing)
 - [Logs and Results](https://drive.google.com/drive/folders/1aVeMRzjL6tW-ZZqQDzd-o6AU2fAeIhfH)
 - [Sutra Code Overview (PDF)](docs/pdfs/Sutra_Code_Overview.pdf)
+- [Product Mechanical Design (STEP)](docs/mechanical/SPOC%202%20%281%29.STEP)
