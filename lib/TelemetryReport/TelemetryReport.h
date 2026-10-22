@@ -14,6 +14,9 @@ struct Snapshot {
     uint32_t uptimeSeconds, maxLoopGapUs;
     uint8_t finger, motion, converged, stable, fresh, savedSessions, episode;
     pdr::Result respiration;
+    // Presentation-only PDR value: 0.0 until the first fresh VALID estimate,
+    // then the most recent fresh VALID estimate. It never changes PDR status.
+    float displayedPdrRate = 0.0f;
     float normalHr = 0, normalIbi = 0;
     // Independent v5 HIGH-motion Elgendi diagnostics, captured once per report.
     // IMPORTANT: Snapshot::ibi remains the ORIGINAL LMS IBI for HRV/RMSSD.

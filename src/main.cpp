@@ -2629,6 +2629,14 @@ void loop()
         snapshot.followUpPlayback = hapticPlayback.state(haptics::Protocol::P1_FOLLOW_UP);
         snapshot.hapticFault = !hapticArray.ready();
         snapshot.respiration = pdrService::read(nowMs);
+        // Presentation-only PDR retention: preserve the last newly measured
+        // VALID value across WEAK/HELD/invalid output without altering the
+        // observer's status, validity, or calculation state.
+        static float displayedPdrRate = 0.0f;
+        if (snapshot.respiration.status == pdr::Status::VALID &&
+            isfinite(snapshot.respiration.rate))
+            displayedPdrRate = snapshot.respiration.rate;
+        snapshot.displayedPdrRate = displayedPdrRate;
         snapshot.normalHr = normalValid ? currentBPM : NAN;
         snapshot.normalIbi = normalValid && currentIBI > 0 ? currentIBI : NAN;
         snapshot.imuOK = latestAccelOK && latestGyroOK;

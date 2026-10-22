@@ -133,7 +133,7 @@ const float shortDev =
     line.append(" | Short:"); p1Counter(line, snapshot.p1Ms[1], snapshot.shortReference);
     line.append(" | P1:%s", snapshot.p1Triggered ? "YES" : "NO");
 
-    line.append("\r\nPDR:"); line.value(pdr.valid ? pdr.rate : NAN, "brpm");
+    line.append("\r\nPDR:"); line.value(snapshot.displayedPdrRate, "brpm");
     line.append(" | PDRStatus:%s", pdr::statusName(pdr.status));
 
     line.append("\r\nPersonalBaseline:"); line.value(snapshot.personal, "ms");

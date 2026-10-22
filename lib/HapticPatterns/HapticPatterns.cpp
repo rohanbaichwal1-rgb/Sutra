@@ -115,7 +115,7 @@ void Patterns::updateFlutter(uint32_t now, uint32_t elapsed)
     // p1Pattern.ino: one motor is on for each 200 ms slot at direct DRO
     // value 60, with no intentional gap between randomized three-motor sets.
     frame_ = Frame{};
-    frame_.level[p1Sequence_[sequenceIndex]] = driverValueToLevel(60);
+    frame_.level[p1Sequence_[sequenceIndex]] = driverValueToLevel(65);
     p1Slot_ = slot;
 }
 
@@ -123,20 +123,23 @@ void Patterns::updateSweep(uint32_t elapsed)
 {
     const uint32_t phase = elapsed % BREATH_CYCLE_MS;
     frame_ = Frame{};
-    // Nonblocking translation of patternTest.ino's 12-second sequence.
-    // Each value is the same intended DA7280 DRO value as the reference.
+
     if (phase < 3000UL)
         frame_.level[0] = frame_.level[2] =
-            driverValueToLevel(5U + 40U * phase / 3000UL); // M1 + M3: 5 -> 45
+            driverValueToLevel(6U + 48U * phase / 3000UL);
+
     else if (phase < 4000UL)
-        frame_.level[1] = driverValueToLevel(50); // M2: 50 hold
+        frame_.level[1] = driverValueToLevel(60);
+
     else if (phase < 5000UL)
-        ;                                   // All motors off
+        ; // All motors OFF
+
     else if (phase < 7000UL)
         frame_.level[1] =
-            driverValueToLevel(50U - 25U * (phase - 5000UL) / 2000UL); // M2: 50 -> 25
+            driverValueToLevel(60U - 30U * (phase - 5000UL) / 2000UL);
+
     else
         frame_.level[0] = frame_.level[2] =
-            driverValueToLevel(25U - 25U * (phase - 7000UL) / 5000UL); // M1 + M3: 25 -> 0
+            driverValueToLevel(30U - 30U * (phase - 7000UL) / 5000UL);
 }
 } // namespace haptics

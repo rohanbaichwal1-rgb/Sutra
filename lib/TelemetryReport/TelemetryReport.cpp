@@ -110,7 +110,7 @@ bool formatLine(Group group, const Snapshot &s, char *output, size_t capacity) {
         break;
     case Group::PDR: {
         const auto &p = s.respiration;
-        line.append("Rate:"); line.value(p.valid ? p.rate : NAN," brpm");
+        line.append("Rate:"); line.value(s.displayedPdrRate," brpm");
         line.append(" | Q:"); line.value(p.valid ? p.quality : NAN,"",2);
         line.append(" | RIAV:"); line.value(p.riav);
         line.append(" | RIFV:"); line.value(p.rifv);
